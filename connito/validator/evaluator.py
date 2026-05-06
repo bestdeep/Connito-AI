@@ -623,7 +623,7 @@ def load_model_from_path(path: str, base_model: nn.Module, device: torch.device)
     return model.to(device)
 
 
-async def _evaluate_on_fresh_loader(
+def _evaluate_on_fresh_loader_sync(
     *,
     config,
     tokenizer,
@@ -639,8 +639,7 @@ async def _evaluate_on_fresh_loader(
     Every caller shares the same `combinded_seed`, so the baseline and all
     miner evals see the same batches — the deltas are comparable.
     """
-    dataloader = await asyncio.to_thread(
-        get_dataloader,
+    dataloader = get_dataloader(
         config=config,
         tokenizer=tokenizer,
         seed=combinded_seed,
@@ -653,12 +652,12 @@ async def _evaluate_on_fresh_loader(
         return evaluate_model(step, model, dataloader, device, max_eval_batches, rank)
 
     try:
-        return await asyncio.to_thread(_run)
+        return _run()
     finally:
         del dataloader
 
 
-async def evaluate_one_miner(
+def evaluate_one_miner_sync(
     *,
     config,
     model_path: str | Path,
@@ -674,31 +673,33 @@ async def evaluate_one_miner(
     max_eval_batches: int = EVAL_MAX_BATCHES,
     rank: int | None = None,
 ) -> "MinerEvalJob | None":
-    """Evaluate a single miner and return the per-round delta-based score.
+    """Synchronous variant of `evaluate_one_miner`.
 
-    Shared between foreground (`evaluate_foreground_round`) and the
-    `BackgroundEvalWorker`. `base_model` is treated as read-only — caller
-    is responsible for not mutating it across calls so successive miners
-    see an identical baseline.
+    All GPU work — `load_model_from_path`, dataloader build, and
+    `evaluate_model` — happens inside this single function so the caller
+    can run the entire eval as one `asyncio.to_thread` task.
 
-    The returned `MinerEvalJob.score` is the raw `(baseline_loss - val_loss)
-    ** 1.2` signal; the caller stores it in `round.scores` via
-    `mark_scored`. The actual reward score sent to the chain is rank-based
-    and written by `finalize_round_scores` at end of round — this function
-    does not touch the global `MinerScoreAggregator`.
-
-    Returns a `MinerEvalJob` on success (so the caller can later use
-    `model_path` for gradient aggregation), or None on failure.
+    That structure matters for cancellation: tasks scheduled via
+    `asyncio.to_thread` are not cancellable, so when an outer
+    `asyncio.wait_for` timeout fires, the awaiter is cancelled but the
+    underlying thread keeps running. If the thread is partway through
+    `copy.deepcopy(base_model)` or `model.to(device)`, the GPU memory it
+    has allocated is still live; starting a second eval in parallel will
+    OOM. Funnelling the whole eval through one `to_thread` task lets
+    callers acquire any GPU lock INSIDE that thread — the lock release
+    then tracks actual GPU completion (not awaiter cancellation), so the
+    next eval naturally blocks on lock acquisition until the previous
+    thread drains.
     """
     try:
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
-        miner_model = await asyncio.to_thread(load_model_from_path, str(model_path), base_model, device)
+        miner_model = load_model_from_path(str(model_path), base_model, device)
 
         try:
-            metrics = await _evaluate_on_fresh_loader(
+            metrics = _evaluate_on_fresh_loader_sync(
                 config=config,
                 tokenizer=tokenizer,
                 combinded_seed=combined_seed,
@@ -765,6 +766,60 @@ async def evaluate_one_miner(
         logger.exception("evaluate_one_miner: failed", uid=int(uid), error=str(e))
         inc_eval_failure(int(uid), "unknown")
         return None
+
+
+async def evaluate_one_miner(
+    *,
+    config,
+    model_path: str | Path,
+    uid: int,
+    hotkey: str,
+    base_model: nn.Module,
+    tokenizer,
+    combined_seed: str,
+    device: torch.device,
+    baseline_loss: float,
+    step: int,
+    round_id: int | None = None,
+    max_eval_batches: int = EVAL_MAX_BATCHES,
+    rank: int | None = None,
+) -> "MinerEvalJob | None":
+    """Evaluate a single miner and return the per-round delta-based score.
+
+    Shared between foreground (`evaluate_foreground_round`) and the
+    `BackgroundEvalWorker`. `base_model` is treated as read-only — caller
+    is responsible for not mutating it across calls so successive miners
+    see an identical baseline.
+
+    The returned `MinerEvalJob.score` is the raw `(baseline_loss - val_loss)
+    ** 1.2` signal; the caller stores it in `round.scores` via
+    `mark_scored`. The actual reward score sent to the chain is rank-based
+    and written by `finalize_round_scores` at end of round — this function
+    does not touch the global `MinerScoreAggregator`.
+
+    Returns a `MinerEvalJob` on success (so the caller can later use
+    `model_path` for gradient aggregation), or None on failure.
+
+    Implementation: thin wrapper that runs `evaluate_one_miner_sync`
+    inside a single `asyncio.to_thread` task. See that function's
+    docstring for why the whole eval is funnelled through one thread.
+    """
+    return await asyncio.to_thread(
+        evaluate_one_miner_sync,
+        config=config,
+        model_path=model_path,
+        uid=uid,
+        hotkey=hotkey,
+        base_model=base_model,
+        tokenizer=tokenizer,
+        combined_seed=combined_seed,
+        device=device,
+        baseline_loss=baseline_loss,
+        step=step,
+        round_id=round_id,
+        max_eval_batches=max_eval_batches,
+        rank=rank,
+    )
 
 
 async def evaluate_foreground_round(

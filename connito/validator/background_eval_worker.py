@@ -315,17 +315,21 @@ class BackgroundEvalWorker(threading.Thread):
             timeout_sec=timeout,
         )
 
-        # Wrap the GPU-touching work so the lock is held only for the eval
-        # itself. evaluate_one_miner is async but the heavy GPU ops happen
-        # inside asyncio.to_thread; we acquire the lock around the whole
-        # call to make the lock-yielding contract explicit.
-        async def _eval_with_lock() -> "MinerEvalJob | None":
-            # Acquire briefly; release right after the call returns.
-            acquired = await asyncio.to_thread(self.gpu_eval_lock.acquire)
-            if not acquired:
-                return None
-            try:
-                return await evaluate_one_miner(
+        # Run the entire eval inside one threadpool task and acquire
+        # `gpu_eval_lock` INSIDE that thread. This couples lock release to
+        # actual GPU completion: when `wait_for` cancels the awaiter on
+        # timeout, the threadpool task keeps running (`asyncio.to_thread`
+        # tasks aren't cancellable), so the lock stays held until GPU work
+        # finishes. The next eval's `to_thread(_run_eval)` call will block
+        # on `gpu_eval_lock.acquire` inside its own thread until the
+        # timed-out thread drains, preventing two concurrent miner-model
+        # allocations on a single GPU (the OOM cascade observed when
+        # cancellation released the lock mid-thread).
+        from connito.validator.evaluator import evaluate_one_miner_sync
+
+        def _run_eval() -> "MinerEvalJob | None":
+            with self.gpu_eval_lock:
+                return evaluate_one_miner_sync(
                     config=self.config,
                     model_path=path,
                     uid=uid,
@@ -338,13 +342,17 @@ class BackgroundEvalWorker(threading.Thread):
                     step=round_obj.round_id,
                     round_id=round_obj.round_id,
                 )
-            finally:
-                self.gpu_eval_lock.release()
 
         try:
-            evaluated = await asyncio.wait_for(_eval_with_lock(), timeout=timeout)
+            evaluated = await asyncio.wait_for(
+                asyncio.to_thread(_run_eval), timeout=timeout,
+            )
         except asyncio.TimeoutError:
-            logger.warning("bg-eval: timeout", uid=uid, hotkey=hotkey[:6], timeout_sec=timeout)
+            logger.warning(
+                "bg-eval: timeout — awaiter dropped; in-flight thread will release "
+                "gpu_eval_lock when GPU work completes",
+                uid=uid, hotkey=hotkey[:6], timeout_sec=timeout,
+            )
             evaluated = None
         except Exception as e:
             logger.exception("bg-eval: failure", uid=uid, error=str(e))
