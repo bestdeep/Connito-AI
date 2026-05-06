@@ -861,8 +861,12 @@ async def evaluate_foreground_round(
 
     # Baseline once against the round's input model (= live `base_model`,
     # which equals round.model_snapshot_cpu since the foreground runs
-    # before Merge(K)).
-    baseline_metrics = await _evaluate_on_fresh_loader(
+    # before Merge(K)). `_evaluate_on_fresh_loader_sync` is sync (per
+    # e692cc7, which moved the GPU work off the event loop); wrap it in
+    # `asyncio.to_thread` so this `async def evaluate_foreground_round`
+    # doesn't block the event loop during the baseline pass.
+    baseline_metrics = await asyncio.to_thread(
+        _evaluate_on_fresh_loader_sync,
         config=config,
         tokenizer=tokenizer,
         combinded_seed=round_obj.seed,
