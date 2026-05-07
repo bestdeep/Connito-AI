@@ -20,11 +20,20 @@ from connito.shared.helper import h256_int, import_from_string
 # iterator can park a worker thread inside an uncancellable network read
 # — observed as the trigger for the bg-eval lock-leak wedges in
 # `notebooks/data/validator_a100_v0.1.38.log` (uid 82, 01:35:59) and
-# `validator_A6000_v0.1.38.log` (uid 50, 23:32:43). A 30 s ceiling lets
-# requests/urllib3 raise on stalled reads instead of hanging until the
-# OS-level TCP RST, so the eval loop unwinds cleanly via
-# `EvalDeadlineExceeded` instead of orphaning `gpu_eval_lock`.
-os.environ.setdefault("HF_HUB_DOWNLOAD_TIMEOUT", "30")
+# `validator_A6000_v0.1.38.log` (uid 50, 23:32:43).
+#
+# 120 s rationale:
+#   * Far above HF.co's healthy response time (<1 s per batch). A single
+#     batch taking 120 s already implies HF is degraded, not just slow.
+#   * Comfortably below the 300 s `per_miner_eval_timeout_sec` ceiling,
+#     so a stalled fetch still trips this and unwinds via the dataloader
+#     iterator long before `wait_for` cancels the awaiter.
+#   * Aligned with `bg-download`'s 180 s file-fetch timeout — both speak
+#     to "HF is unreachable" rather than "HF is slow."
+#   * `setdefault` so operators can override with `HF_HUB_DOWNLOAD_TIMEOUT`
+#     in the env without code changes (e.g. raise to 300 on a flaky
+#     network, or lower for faster failure-detection).
+os.environ.setdefault("HF_HUB_DOWNLOAD_TIMEOUT", "120")
 
 logger = structlog.get_logger(__name__)
 
