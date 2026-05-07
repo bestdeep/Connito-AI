@@ -3,6 +3,7 @@ from __future__ import annotations
 import re
 import time
 import traceback
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 from pathlib import Path
 
 import bittensor
@@ -25,7 +26,11 @@ from connito.shared.checkpoints import (
 )
 from connito.shared.config import MinerConfig, ValidatorConfig, WorkerConfig
 from connito.shared.hf_distribute import download_checkpoint_from_hf
-from connito.shared.cycle import PhaseNames, get_blocks_from_previous_phase_from_api
+from connito.shared.cycle import (
+    PhaseNames,
+    get_blocks_from_previous_phase_from_api,
+    get_validator_seed_from_commit,
+)
 from connito.shared.expert_manager import (
     ExpertManager,
     get_layer_expert_id,
@@ -54,6 +59,47 @@ def _build_download_targets(expert_group_ids: list[int | str]) -> list[tuple[int
 def _clear_download_targets(out_folder: Path, filenames: list[str]) -> None:
     for filename in filenames:
         (out_folder / filename).unlink(missing_ok=True)
+
+
+def _download_checkpoint_from_hf_with_timeout(
+    *,
+    repo_id: str,
+    revision: str,
+    filenames: list[str],
+    dest_dir: Path,
+    token_env_var: str | None,
+    timeout_sec: float | None,
+) -> None:
+    if timeout_sec is None:
+        download_checkpoint_from_hf(
+            repo_id=repo_id,
+            revision=revision,
+            filenames=filenames,
+            dest_dir=dest_dir,
+            token_env_var=token_env_var,
+        )
+        return
+
+    # ThreadPoolExecutor lets us bound the wall-clock of the underlying call.
+    # The thread itself isn't cancellable (huggingface_hub uses requests under
+    # the hood), so on timeout we shutdown without waiting and leave the
+    # worker to unwind whenever its OS socket eventually closes.
+    ex = ThreadPoolExecutor(max_workers=1, thread_name_prefix="hf-chain-dl")
+    future = ex.submit(
+        download_checkpoint_from_hf,
+        repo_id=repo_id,
+        revision=revision,
+        filenames=filenames,
+        dest_dir=dest_dir,
+        token_env_var=token_env_var,
+    )
+    try:
+        future.result(timeout=timeout_sec)
+    finally:
+        # wait=False: don't block on the orphan thread if the download is hung.
+        # cancel_futures=True is a no-op for an already-running future, but
+        # keeps the call symmetric for queued ones.
+        ex.shutdown(wait=False, cancel_futures=True)
 
 
 def grad_hook(name):
@@ -243,10 +289,21 @@ def fetch_model_from_chain_validator(
     subtensor: bittensor.Subtensor,
     wallet: bittensor.Wallet,
     expert_group_ids: list[int | str],
-    expert_group_assignment: ExpertAssignments
+    expert_group_assignment: ExpertAssignments,
+    allowed_hotkeys: set[str] | None = None,
+    download_timeout_sec: float | None = None,
 ) -> dict | None:
     """
     Fetches a model from the chain validator if it's has the right commit format from the previous phase commits (validator_commit_1 & validator_commit_2) and newer than the current model.
+
+    When ``allowed_hotkeys`` is provided, chain checkpoints whose hotkey is not
+    in the set are dropped before download. Used by peer sync to require the
+    source be one of the assignment validators.
+
+    When ``download_timeout_sec`` is set, each per-checkpoint
+    ``download_checkpoint_from_hf`` call is bounded by that wall clock and a
+    timeout is treated as a download failure (retried/skipped to the next
+    candidate by the existing retry budget).
     """
     try:
         owner_hotkey = subtensor.get_subnet_owner_hotkey(netuid=config.chain.netuid)
@@ -258,12 +315,28 @@ def fetch_model_from_chain_validator(
         config=config, subtensor=subtensor, for_role="validator", owner_hotkey=owner_hotkey
     )
 
+    if allowed_hotkeys is not None:
+        before = len(chain_checkpoints.checkpoints)
+        kept = [
+            ckpt for ckpt in chain_checkpoints.checkpoints
+            if ckpt.hotkey is not None and ckpt.hotkey in allowed_hotkeys
+        ]
+        dropped = before - len(kept)
+        if dropped:
+            logger.info(
+                "fetch_model_from_chain_validator: dropped checkpoints not in allowed_hotkeys",
+                dropped=dropped,
+                kept=len(kept),
+                allowed_hotkey_count=len(allowed_hotkeys),
+            )
+        chain_checkpoints = ChainCheckpoints(checkpoints=kept)
+
     # --- Filter to only newer than current model ---
-    if current_model_meta is not None: 
+    if current_model_meta is not None:
         chain_checkpoints = ChainCheckpoints(
             checkpoints=[ckpt for ckpt in chain_checkpoints.checkpoints if ckpt > current_model_meta]
         )
-        
+
     should_download = len(chain_checkpoints.checkpoints) > 0
 
     logger.info(
@@ -305,13 +378,29 @@ def fetch_model_from_chain_validator(
                 _clear_download_targets(out_folder, filenames)
 
                 try:
-                    download_checkpoint_from_hf(
+                    _download_checkpoint_from_hf_with_timeout(
                         repo_id=chain_checkpoint.hf_repo_id,
                         revision=chain_checkpoint.hf_revision,
                         filenames=filenames,
                         dest_dir=out_folder,
                         token_env_var=config.hf.token_env_var,
+                        timeout_sec=download_timeout_sec,
                     )
+                except FuturesTimeoutError:
+                    # The thread running download_checkpoint_from_hf cannot be
+                    # killed from Python — it stays orphaned until the OS-level
+                    # socket times out — but the main loop is freed and moves
+                    # on to the next candidate / retry, which is the whole
+                    # point of this guard.
+                    logger.warning(
+                        "Checkpoint download from HF timed out",
+                        uid=chain_checkpoint.uid,
+                        hotkey=chain_checkpoint.hotkey,
+                        hf_repo_id=chain_checkpoint.hf_repo_id,
+                        hf_revision=chain_checkpoint.hf_revision,
+                        timeout_sec=download_timeout_sec,
+                    )
+                    continue
                 except Exception as e:
                     logger.warning(
                         "Checkpoint download from HF failed",
@@ -389,10 +478,36 @@ def reload_model_inplace(
     logger.info("Pulling model from peer validator to re-sync excluded validator")
     t_start = time.monotonic()
 
+    # Restrict the peer-sync source set to the same validator pool used by
+    # validator-miner assignment (validators that committed a
+    # ValidatorChainCommit for this expert_group). Any chain entry from a
+    # non-assignment hotkey — e.g. a stake-0 / unverified commit — is
+    # rejected before the HF download so a bad source can't stall the cycle.
+    try:
+        commits = get_chain_commits(config, subtensor)
+        validator_seeds = get_validator_seed_from_commit(config, commits)
+        allowed_hotkeys = set(validator_seeds.keys())
+    except Exception as e:
+        logger.warning(
+            "Peer sync: could not resolve assignment validator whitelist; aborting",
+            error=str(e),
+        )
+        return False
+
+    if not allowed_hotkeys:
+        logger.warning(
+            "Peer sync: no assignment validators found on chain; aborting"
+        )
+        return False
+
+    download_timeout_sec = float(config.evaluation.per_miner_download_timeout_sec)
+
     logger.info(
         "Peer sync: fetching latest checkpoint from chain",
         primary_dir=str(config.ckpt.validator_checkpoint_path),
         secondary_dir=str(config.ckpt.checkpoint_path),
+        allowed_hotkey_count=len(allowed_hotkeys),
+        download_timeout_sec=download_timeout_sec,
     )
     t_fetch = time.monotonic()
     try:
@@ -401,8 +516,10 @@ def reload_model_inplace(
             config=config,
             subtensor=subtensor,
             wallet=wallet,
-            expert_group_ids=[config.task.exp.group_id, "shared"],
+            expert_group_ids=[config.task.exp.group_id],
             expert_group_assignment=expert_manager.expert_group_assignment,
+            allowed_hotkeys=allowed_hotkeys,
+            download_timeout_sec=download_timeout_sec,
         )
     except Exception as e:
         logger.warning(
@@ -445,7 +562,7 @@ def reload_model_inplace(
         t_load = time.monotonic()
         sd = compile_full_state_dict_from_path(
             latest.path,
-            expert_groups=[config.task.exp.group_id, "shared"],
+            expert_groups=[config.task.exp.group_id],
         )
         load_elapsed = round(time.monotonic() - t_load, 2)
         if not sd:

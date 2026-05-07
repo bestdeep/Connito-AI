@@ -290,7 +290,7 @@ class CheckpointCfg(BaseConfig):
     validator_checkpoint_path: Path = Path("validator_checkpoint")
     # Legacy compatibility knob. Miner checkpoint downloads pull from HF only,
     # but older configs may still include this field.
-    download_concurrency: PositiveInt = 4
+    download_concurrency: PositiveInt = 1
 
 
 class HfCfg(BaseConfig):
