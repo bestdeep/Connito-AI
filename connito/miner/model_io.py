@@ -284,9 +284,19 @@ def _upload_checkpoint_to_hf_safe(
                 f"miner submission global_ver={latest_checkpoint.global_ver} "
                 f"expert_group={config.task.exp.group_id}"
             ),
-            # Validators only fetch model_expgroup_{group_id}.pt from miner
-            # submissions, so skip model_shared.pt to keep uploads small.
-            allow_patterns=[f"model_expgroup_{config.task.exp.group_id}.pt"],
+            # Validators fetch this validator's expert-group shard. New
+            # miners ship `.safetensors` (no pickle, no code-execution
+            # surface); the validator's download worker (PR #98) tries
+            # `.safetensors` first and falls back to `.pt`, so we include
+            # both extensions during the migration window so a miner
+            # upgrading mid-cycle whose latest checkpoint is still `.pt`
+            # doesn't end up with an empty upload. `model_shared.*` is
+            # intentionally excluded — validators only fetch the expert-
+            # group shard, and skipping it keeps uploads small.
+            allow_patterns=[
+                f"model_expgroup_{config.task.exp.group_id}.safetensors",
+                f"model_expgroup_{config.task.exp.group_id}.pt",
+            ],
         )
     except Exception as e:
         inc_error("checkpoint_upload", _classify_upload_error(e))

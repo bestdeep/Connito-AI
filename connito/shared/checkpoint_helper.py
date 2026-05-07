@@ -365,10 +365,17 @@ def save_state_dict_by_expert_group(
             samples=skipped_experts_samples,
         )
 
-    # Save the groups
+    # Save the groups. Format is `.safetensors` — the validator's download
+    # path tries `.safetensors` before `.pt` (PR #98), so this is the
+    # preferred format for new uploads. `.safetensors` has no pickle code
+    # path, so a corrupt or malicious checkpoint can't execute code on the
+    # validator host. The on-chain `model_hash` is computed from the
+    # in-memory state_dict (see `get_model_hash` / `serialize_torch_model_path`),
+    # so it's identical regardless of file format — no chain commit changes.
+    from safetensors.torch import save_file
     paths = {}
     for gid, sd in grouped_state.items():
-        fname = f"model_expgroup_{gid}.pt" if gid != "shared" else "model_shared.pt"
+        fname = f"model_expgroup_{gid}.safetensors" if gid != "shared" else "model_shared.safetensors"
         path = os.path.join(save_dir, fname)
 
         estimated_bytes = int(group_bytes[gid] * 1.05) + (64 * 1024 * 1024)
@@ -388,7 +395,10 @@ def save_state_dict_by_expert_group(
             model_hash=get_model_hash(sd, hex=True)[:6],
         )
         try:
-            torch.save({"model_state_dict": sd}, path)
+            # safetensors requires contiguous tensors and rejects non-tensor
+            # values; the state_dict here is pure tensors by construction
+            # (see `save_state_dict_by_expert_group`'s caller in `save_checkpoint`).
+            save_file({k: v.contiguous() for k, v in sd.items()}, path)
         except Exception as e:
             free_bytes_after = shutil.disk_usage(save_dir).free
             raise RuntimeError(
@@ -592,10 +602,16 @@ def compile_full_state_dict_from_path(checkpoint_path, expert_groups: list[int |
             return any(_matches_expert_group(file_path, g) for g in groups)
 
         filename = Path(file_path).name
+        # Accept both `.safetensors` (new default) and `.pt` (legacy) so a
+        # miner upgrading mid-cycle can still resume from a `.pt` shard
+        # saved by the previous version.
         if groups == "shared":
-            return filename == "model_shared.pt"
+            return filename in ("model_shared.safetensors", "model_shared.pt")
 
-        return filename == f"model_expgroup_{groups}.pt"
+        return filename in (
+            f"model_expgroup_{groups}.safetensors",
+            f"model_expgroup_{groups}.pt",
+        )
 
     full_state_dict = {}
     checkpoint_path = Path(checkpoint_path)
@@ -609,18 +625,34 @@ def compile_full_state_dict_from_path(checkpoint_path, expert_groups: list[int |
 
     else:
         model_files = get_model_files(checkpoint_path)
-    
+
         for f in model_files:
             if expert_groups is not None and not _matches_expert_group(f.path, expert_groups):
                 logger.debug("skipping checkpoint file", path=f, expert_groups=expert_groups)
                 continue
 
-            with f as fh:
-                state_dict = torch.load(fh, map_location=torch.device("cpu"))
-                full_state_dict.update(state_dict["model_state_dict"])
-                loss = state_dict["loss"] if "loss" in state_dict else -1
-                del state_dict
-                logger.debug("loaded checkpoint file", path=f, loss=round(loss, 5))
+            # Dispatch on suffix: `.safetensors` shards are flat tensor dicts
+            # (no `{"model_state_dict": ...}` wrapper, no `loss` key); `.pt`
+            # shards retain the legacy wrapped format saved by older miner
+            # versions. `load_state_dict_from_path` already handles both for
+            # the single-file branch above; here we replicate the suffix
+            # logic inline because we need to keep the open-file handle from
+            # `fsspec.open_files`.
+            suffix = Path(f.path).suffix.lower()
+            if suffix == ".safetensors":
+                from safetensors.torch import load_file
+                shard_sd = load_file(str(f.path), device="cpu")
+                full_state_dict.update(shard_sd)
+                logger.debug("loaded checkpoint file", path=f, format="safetensors")
+            else:
+                with f as fh:
+                    state_dict = torch.load(
+                        fh, map_location=torch.device("cpu"), weights_only=True,
+                    )
+                    full_state_dict.update(state_dict["model_state_dict"])
+                    loss = state_dict["loss"] if "loss" in state_dict else -1
+                    del state_dict
+                    logger.debug("loaded checkpoint file", path=f, loss=round(loss, 5))
 
     return full_state_dict
 
@@ -828,14 +860,18 @@ def load_checkpoint(
 def get_model_files(checkpoint_path):
     checkpoint_path = Path(checkpoint_path)  # normalize to Path object
 
-    # Case 1: checkpoint_path IS a .pt file
-    if checkpoint_path.is_file() and checkpoint_path.suffix == ".pt":
+    # Case 1: checkpoint_path IS a single checkpoint file (.safetensors preferred, .pt legacy).
+    if checkpoint_path.is_file() and checkpoint_path.suffix in MINER_CHECKPOINT_SUFFIXES:
         return fsspec.open_files(str(checkpoint_path), mode="rb")
 
-    # Case 2: checkpoint_path is a directory → match model*.pt inside it
-    pattern = str(checkpoint_path / "model*.pt")
-    files = fsspec.open_files(pattern, mode="rb")
-
+    # Case 2: checkpoint_path is a directory → match model*.{safetensors,pt}
+    # inside it. The list is concatenated so callers see a single iterable
+    # (preserves the existing API contract). `.safetensors` listed first so
+    # if both exist for the same shard the new format wins on dispatch order.
+    files = []
+    for suffix in MINER_CHECKPOINT_SUFFIXES:
+        pattern = str(checkpoint_path / f"model*{suffix}")
+        files.extend(fsspec.open_files(pattern, mode="rb"))
     return files
 
 

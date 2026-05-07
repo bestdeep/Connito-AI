@@ -78,8 +78,11 @@ def test_non_strict_sharding_writes_shared_and_group_files(tmp_path):
 
     assert 0 in paths
     assert "shared" in paths
-    assert (tmp_path / "model_expgroup_0.pt").exists()
-    assert (tmp_path / "model_shared.pt").exists()
+    # Format migrated to safetensors (PR XXX) — `.pt` is no longer written.
+    assert (tmp_path / "model_expgroup_0.safetensors").exists()
+    assert (tmp_path / "model_shared.safetensors").exists()
+    assert not (tmp_path / "model_expgroup_0.pt").exists()
+    assert not (tmp_path / "model_shared.pt").exists()
 
 
 def test_strict_sharding_rejects_empty_expert_group_shard(tmp_path):
