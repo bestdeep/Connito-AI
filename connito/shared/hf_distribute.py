@@ -12,11 +12,14 @@ from connito.shared.app_logging import structlog
 
 logger = structlog.get_logger(__name__)
 
-# Metadata (HEAD) request timeout passed explicitly to `hf_hub_download` so a
-# stuck etag lookup can't extend our wall-clock budget. HF's chunk-fetch
-# timeout is controlled separately via the `HF_HUB_DOWNLOAD_TIMEOUT` env var
-# (default 10s) — we don't override that here so operators can tune it.
-_HF_ETAG_TIMEOUT_SEC = 10.0
+# Metadata (HEAD) request timeout passed explicitly to `hf_hub_download`.
+# Sized to the per-miner download budget so a slow HF metadata service
+# doesn't fail an otherwise-valid fetch; the outer
+# `download_checkpoint_from_hf_with_timeout` is the real wall-clock guard.
+# HF's chunk-fetch timeout is controlled separately via the
+# `HF_HUB_DOWNLOAD_TIMEOUT` env var (default 10s) — we don't override that
+# here so operators can tune it.
+_HF_ETAG_TIMEOUT_SEC = 180.0
 
 
 def _resolve_token(token: str | None, env_var: str) -> str | None:
