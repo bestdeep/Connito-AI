@@ -164,7 +164,7 @@ def test_fetch_model_does_not_issue_http_when_hf_succeeds(tmp_path):
 
     with patch.object(shared_model, "build_chain_checkpoints_from_previous_phase",
                       return_value=ChainCheckpoints(checkpoints=[chain_checkpoint])), \
-         patch.object(shared_model, "download_checkpoint_from_hf", side_effect=fake_hf_download), \
+         patch.object(shared_model, "download_checkpoint_from_hf_with_timeout", side_effect=fake_hf_download), \
          patch.object(shared_model, "delete_old_checkpoints"), \
          patch.object(ChainCheckpoint, "validate", return_value=True), \
          patch("requests.get", side_effect=AssertionError("HTTP distribute must not happen")), \
@@ -209,7 +209,7 @@ def test_fetch_model_does_not_issue_http_when_hf_fails(tmp_path):
 
     with patch.object(shared_model, "build_chain_checkpoints_from_previous_phase",
                       return_value=ChainCheckpoints(checkpoints=[chain_checkpoint])), \
-         patch.object(shared_model, "download_checkpoint_from_hf", side_effect=RuntimeError("hf down")), \
+         patch.object(shared_model, "download_checkpoint_from_hf_with_timeout", side_effect=RuntimeError("hf down")), \
          patch.object(shared_model, "delete_old_checkpoints"), \
          patch.object(shared_model.time, "sleep"), \
          patch.object(ChainCheckpoint, "validate", return_value=True), \

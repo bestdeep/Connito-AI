@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+from concurrent.futures import ThreadPoolExecutor
 from functools import lru_cache
 from pathlib import Path
 
@@ -10,6 +11,12 @@ from huggingface_hub.utils import HfHubHTTPError, RepositoryNotFoundError
 from connito.shared.app_logging import structlog
 
 logger = structlog.get_logger(__name__)
+
+# Metadata (HEAD) request timeout passed explicitly to `hf_hub_download` so a
+# stuck etag lookup can't extend our wall-clock budget. HF's chunk-fetch
+# timeout is controlled separately via the `HF_HUB_DOWNLOAD_TIMEOUT` env var
+# (default 10s) — we don't override that here so operators can tune it.
+_HF_ETAG_TIMEOUT_SEC = 10.0
 
 
 def _resolve_token(token: str | None, env_var: str) -> str | None:
@@ -182,6 +189,7 @@ def download_checkpoint_from_hf(
                 filename=fname,
                 local_dir=str(dest_dir),
                 token=resolved_token,
+                etag_timeout=_HF_ETAG_TIMEOUT_SEC,
             )
     except RepositoryNotFoundError as e:
         raise RuntimeError(
@@ -196,3 +204,56 @@ def download_checkpoint_from_hf(
         dest_dir=str(dest_dir),
     )
     return dest_dir
+
+
+def download_checkpoint_from_hf_with_timeout(
+    *,
+    repo_id: str,
+    revision: str,
+    filenames: list[str],
+    dest_dir: Path,
+    token: str | None = None,
+    token_env_var: str = "HF_TOKEN",
+    timeout_sec: float | None,
+) -> Path:
+    """Wall-clock-bounded variant of `download_checkpoint_from_hf`.
+
+    `asyncio.wait_for(asyncio.to_thread(...))` cannot interrupt a thread
+    blocked inside `huggingface_hub` (it uses requests/httpx under the hood),
+    so a hung download leaks a worker into the asyncio default executor pool
+    indefinitely. Once enough leak, every subsequent `asyncio.to_thread`
+    call queues behind a zombie and times out without ever sending bytes.
+
+    Instead, run each attempt in its own one-shot ThreadPoolExecutor. On
+    timeout we `shutdown(wait=False, cancel_futures=True)` so the zombie
+    detaches from this caller; the underlying thread continues until its OS
+    socket eventually closes, but it no longer blocks the asyncio loop and
+    no longer starves unrelated `to_thread` callers.
+    """
+    if timeout_sec is None:
+        return download_checkpoint_from_hf(
+            repo_id=repo_id,
+            revision=revision,
+            filenames=filenames,
+            dest_dir=dest_dir,
+            token=token,
+            token_env_var=token_env_var,
+        )
+
+    executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="hf-dl")
+    future = executor.submit(
+        download_checkpoint_from_hf,
+        repo_id=repo_id,
+        revision=revision,
+        filenames=filenames,
+        dest_dir=dest_dir,
+        token=token,
+        token_env_var=token_env_var,
+    )
+    try:
+        return future.result(timeout=timeout_sec)
+    finally:
+        # wait=False: a hung thread won't be joined — we accept the leak so
+        # the caller can move on. cancel_futures=True clears anything queued
+        # (no-op here since max_workers=1 and we submitted one task).
+        executor.shutdown(wait=False, cancel_futures=True)
