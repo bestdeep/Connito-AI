@@ -107,12 +107,17 @@ def save_state_dict_by_expert_group(
     """
     Split a full model state_dict into checkpoint shards.
 
+    Only expert-group shards are written. Non-expert (backbone) params are
+    deliberately dropped — every participant reconstructs them deterministically
+    from ``config.model.model_path`` at startup via ``from_pretrained``, so
+    persisting and shipping them is wasted bandwidth and risks divergence
+    between hosts that started from different bootstrap snapshots.
+
     Modes:
         - active_expert_group_id is None:
-            write one shard per expert group plus model_shared.pt.
+            write one shard per expert group.
         - active_expert_group_id is set:
-            write model_expgroup_{id}.pt with experts owned by that group only,
-            plus model_shared.pt containing all shared/non-expert params.
+            write model_expgroup_{id}.pt with experts owned by that group only.
     """
 
     os.makedirs(save_dir, exist_ok=True)
@@ -133,12 +138,8 @@ def save_state_dict_by_expert_group(
 
     group_ids = [active_expert_group_id] if active_expert_group_id is not None else list(expert_groups.keys())
 
-    has_shared_bucket = True
-
-    # output buckets
+    # output buckets — one per expert group only; non-expert params are not persisted.
     grouped_state = {gid: {} for gid in group_ids}
-    if has_shared_bucket:
-        grouped_state["shared"] = {}
 
     # Build fast-lookup structures:
     # - org_expert_lookup uses original/global expert IDs (preferred, unambiguous)
@@ -204,26 +205,25 @@ def save_state_dict_by_expert_group(
     # Track per-group counts and bytes for debugging
     group_param_count: dict[int | str, int] = {gid: 0 for gid in group_ids}
     group_bytes: dict[int | str, int] = {gid: 0 for gid in group_ids}
-    if has_shared_bucket:
-        group_param_count["shared"] = 0
-        group_bytes["shared"] = 0
     unassigned_experts: list[str] = []
     skipped_experts_samples: list[str] = []
     skipped_experts_count = 0
     detected_expert_param_count = 0
     assigned_expert_param_count = 0
+    non_expert_param_count = 0
 
     # Iterate model weights
     # Convert only selected tensors to CPU fp16 (post-filter) to keep peak RAM low.
     # This avoids materializing a full CPU copy before sharding.
     for name, tensor in state_dict.items():
         layer_id, expert_id = get_layer_expert_id(name)
-        # CASE 1: Not an expert parameter
+        # CASE 1: Not an expert parameter — drop. Every participant reconstructs
+        # the backbone deterministically from `config.model.model_path` at boot,
+        # so persisting these would be wasted bytes (and historically caused
+        # divergence between validators when locally-trained shared weights
+        # were retained in old globalver_* directories).
         if layer_id is None or expert_id is None:
-            t = tensor.detach().to(dtype=save_dtype, device="cpu", non_blocking=True).contiguous()
-            grouped_state["shared"][name] = t
-            group_param_count["shared"] += 1
-            group_bytes["shared"] += t.nelement() * t.element_size()
+            non_expert_param_count += 1
             continue
 
         detected_expert_param_count += 1
@@ -254,15 +254,11 @@ def save_state_dict_by_expert_group(
             gid = my_expert_lookup.get(key, None)
 
         if gid is None:
-            # expert exists but not assigned to any group.
-            # In full-shard mode these go to shared for backward compatibility.
-            if has_shared_bucket:
-                t = tensor.detach().to(dtype=save_dtype, device="cpu", non_blocking=True).contiguous()
-                grouped_state["shared"][name] = t
-                group_param_count["shared"] += 1
-                group_bytes["shared"] += t.nelement() * t.element_size()
-                reason = "ambiguous_local_id" if key in ambiguous_my_expert_keys else "unmapped"
-                unassigned_experts.append(f"{name} (layer={layer_id}, expert={expert_id}, reason={reason})")
+            # Expert exists but not assigned to any group — drop. Previously these
+            # went into the shared bucket as a fallback; that bucket no longer
+            # exists, so unmapped experts are reported and skipped.
+            reason = "ambiguous_local_id" if key in ambiguous_my_expert_keys else "unmapped"
+            unassigned_experts.append(f"{name} (layer={layer_id}, expert={expert_id}, reason={reason})")
         else:
             t = tensor.detach().to(dtype=save_dtype, device="cpu", non_blocking=True).contiguous()
             grouped_state[gid][name] = t
@@ -270,18 +266,14 @@ def save_state_dict_by_expert_group(
             group_bytes[gid] += t.nelement() * t.element_size()
             assigned_expert_param_count += 1
 
-    # Validate no overlap of expert keys across groups and no expert keys in shared.
+    # Validate no overlap of expert keys across groups.
     expert_key_owner: dict[str, int] = {}
     overlap_errors: list[str] = []
-    shared_expert_keys: list[str] = []
     for gid, sd in grouped_state.items():
         for param_name in sd:
             layer_id, expert_id = get_layer_expert_id(param_name)
             is_expert = layer_id is not None and expert_id is not None
-            if gid == "shared" and is_expert:
-                shared_expert_keys.append(param_name)
-                continue
-            if gid != "shared" and is_expert:
+            if is_expert:
                 owner = expert_key_owner.get(param_name)
                 if owner is None:
                     expert_key_owner[param_name] = gid
@@ -304,11 +296,11 @@ def save_state_dict_by_expert_group(
         if strict_sharding:
             preview = "; ".join(unassigned_experts[:10])
             raise ValueError(
-                "Strict sharding violation: some expert params are unmapped/ambiguous and would go to shared. "
+                "Strict sharding violation: some expert params are unmapped/ambiguous. "
                 f"count={len(unassigned_experts)} samples={preview}"
             )
         logger.warning(
-            "Expert params not assigned to any group (went to shared)",
+            "Expert params not assigned to any group (dropped from save)",
             count=len(unassigned_experts),
             samples=unassigned_experts[:10],
         )
@@ -329,17 +321,7 @@ def save_state_dict_by_expert_group(
             group_ids=group_ids,
         )
 
-    # Contract validation: shared must contain no expert params; each expert-group file
-    # must contain expert params only.
-    shared_expert_keys = [
-        name for name in grouped_state["shared"] if get_layer_expert_id(name)[1] is not None
-    ]
-    if strict_sharding and shared_expert_keys:
-        raise ValueError(
-            "Strict sharding violation: model_shared.pt would contain expert params. "
-            f"samples={shared_expert_keys[:10]}"
-        )
-
+    # Contract validation: each expert-group file must contain expert params only.
     for gid in group_ids:
         non_expert_keys = [
             name
@@ -375,7 +357,7 @@ def save_state_dict_by_expert_group(
     from safetensors.torch import save_file
     paths = {}
     for gid, sd in grouped_state.items():
-        fname = f"model_expgroup_{gid}.safetensors" if gid != "shared" else "model_shared.safetensors"
+        fname = f"model_expgroup_{gid}.safetensors"
         path = os.path.join(save_dir, fname)
 
         estimated_bytes = int(group_bytes[gid] * 1.05) + (64 * 1024 * 1024)
@@ -596,7 +578,13 @@ def load_optimizer(checkpoint_path, optimizer):
 def compile_full_state_dict_from_path(checkpoint_path, expert_groups: list[int | str] | None = None):
     def _matches_expert_group(file_path: str | Path, groups) -> bool:
         if groups is None:
-            return True
+            # No filter: still skip any legacy `model_shared.*` file so that
+            # backbone state from old globalver_* directories is never loaded
+            # — the backbone is reproduced deterministically from
+            # `config.model.model_path` at instantiation time, see the
+            # rationale in `save_state_dict_by_expert_group`.
+            filename = Path(file_path).name
+            return filename not in ("model_shared.safetensors", "model_shared.pt")
 
         if isinstance(groups, (list, tuple, set)):
             return any(_matches_expert_group(file_path, g) for g in groups)
@@ -605,9 +593,6 @@ def compile_full_state_dict_from_path(checkpoint_path, expert_groups: list[int |
         # Accept both `.safetensors` (new default) and `.pt` (legacy) so a
         # miner upgrading mid-cycle can still resume from a `.pt` shard
         # saved by the previous version.
-        if groups == "shared":
-            return filename in ("model_shared.safetensors", "model_shared.pt")
-
         return filename in (
             f"model_expgroup_{groups}.safetensors",
             f"model_expgroup_{groups}.pt",

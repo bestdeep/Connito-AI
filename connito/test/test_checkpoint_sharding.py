@@ -57,7 +57,7 @@ def test_strict_sharding_rejects_duplicate_org_assignment(tmp_path):
         raise AssertionError("Expected strict sharding to reject duplicate org expert assignments")
 
 
-def test_non_strict_sharding_writes_shared_and_group_files(tmp_path):
+def test_non_strict_sharding_writes_only_expert_group_files(tmp_path):
     state_dict = {
         "model.embed_tokens.weight": _tensor(),
         "model.layers.1.mlp.experts.0.gate_up_proj": _tensor(),
@@ -77,11 +77,14 @@ def test_non_strict_sharding_writes_shared_and_group_files(tmp_path):
     )
 
     assert 0 in paths
-    assert "shared" in paths
+    # The non-expert param (`model.embed_tokens.weight`) is intentionally
+    # dropped — backbone state is reconstructed from from_pretrained at
+    # startup, not persisted to disk.
+    assert "shared" not in paths
     # Format migrated to safetensors (PR XXX) — `.pt` is no longer written.
     assert (tmp_path / "model_expgroup_0.safetensors").exists()
-    assert (tmp_path / "model_shared.safetensors").exists()
     assert not (tmp_path / "model_expgroup_0.pt").exists()
+    assert not (tmp_path / "model_shared.safetensors").exists()
     assert not (tmp_path / "model_shared.pt").exists()
 
 

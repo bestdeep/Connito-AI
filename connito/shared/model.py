@@ -50,7 +50,13 @@ def _build_download_targets(expert_group_ids: list[int | str]) -> list[tuple[int
         if isinstance(expert_group_id, int):
             targets.append((expert_group_id, f"model_expgroup_{expert_group_id}.pt"))
         elif expert_group_id == "shared":
-            targets.append((expert_group_id, "model_shared.pt"))
+            # `model_shared` is no longer persisted or distributed; backbone state
+            # is reconstructed from `config.model.model_path` at instantiation.
+            # Tolerated here for backward compatibility with callers that still
+            # pass the sentinel, but it's a no-op.
+            logger.debug(
+                "expert_group_id='shared' is deprecated and ignored — backbone is loaded from from_pretrained",
+            )
         else:
             logger.warning("Invalid expert_group_id, skipping", expert_group_id=expert_group_id)
     return targets
@@ -231,7 +237,12 @@ def get_model_from_checkpoint(
                 model=model,
                 rank=rank,
                 device=checkpoint_device if checkpoint_device is not None else config.model.device,
-                expert_groups=[config.task.exp.group_id, "shared"] if partial else None,
+                # Only the active expert group is read from disk. Any legacy
+                # `model_shared.*` next to it is ignored — backbone state is
+                # already in `model` from `get_base_model`'s from_pretrained,
+                # and we no longer trust on-disk shared weights (they were a
+                # source of cross-validator divergence; see PR description).
+                expert_groups=[config.task.exp.group_id] if partial else None,
             )
         else:
             logger.info("Tried to resume from checkpoint, but no checkpoint found.")

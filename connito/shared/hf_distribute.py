@@ -129,14 +129,21 @@ def upload_checkpoint_to_hf(
         if getattr(e.response, "status_code", None) not in (409,):
             raise
 
-    # Default uploads model_expgroup_N.pt + model_shared.pt (validator publish);
-    # miners override to drop model_shared.pt since validators only fetch the
-    # expert-group shard from miner submissions.
+    # Default uploads expert-group shards only (both `.pt` and `.safetensors`
+    # during the migration window). `model_shared.*` is intentionally excluded
+    # from the default: it's no longer persisted or distributed; every
+    # participant reconstructs backbone state from `config.model.model_path`
+    # at startup. Callers that need different behavior can override
+    # `allow_patterns` explicitly.
+    default_allow_patterns = [
+        "model_expgroup_*.pt",
+        "model_expgroup_*.safetensors",
+    ]
     commit_info = api.upload_folder(
         folder_path=str(ckpt_dir),
         repo_id=repo_id,
         commit_message=commit_message or f"checkpoint upload from {ckpt_dir.name}",
-        allow_patterns=allow_patterns if allow_patterns is not None else ["model*.pt"],
+        allow_patterns=allow_patterns if allow_patterns is not None else default_allow_patterns,
     )
     revision = commit_info.oid[:12]
     logger.info(
@@ -158,9 +165,11 @@ def download_checkpoint_from_hf(
 ) -> Path:
     """Download specific files from a HF repo revision into dest_dir.
 
-    We download only the shards the caller needs (e.g. `model_expgroup_3.pt`
-    + `model_shared.pt`) rather than the whole repo, since a validator may
-    publish every expert group and a given miner only needs one or two.
+    We download only the shards the caller needs (e.g. `model_expgroup_3.pt`)
+    rather than the whole repo, since a validator may publish every expert
+    group and a given miner only needs one. `model_shared.*` is no longer
+    distributed; backbone state is reconstructed from
+    `config.model.model_path` at instantiation.
     """
     resolved_token = _resolve_token(token, token_env_var)
     dest_dir.mkdir(parents=True, exist_ok=True)
