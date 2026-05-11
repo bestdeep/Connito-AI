@@ -3,7 +3,7 @@ from __future__ import annotations
 import re
 import time
 import traceback
-from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
+from concurrent.futures import TimeoutError as FuturesTimeoutError
 from pathlib import Path
 
 import bittensor
@@ -25,7 +25,7 @@ from connito.shared.checkpoints import (
     select_best_checkpoint,
 )
 from connito.shared.config import MinerConfig, ValidatorConfig, WorkerConfig
-from connito.shared.hf_distribute import download_checkpoint_from_hf
+from connito.shared.hf_distribute import download_checkpoint_from_hf_with_timeout
 from connito.shared.cycle import (
     PhaseNames,
     get_blocks_from_previous_phase_from_api,
@@ -76,36 +76,14 @@ def _download_checkpoint_from_hf_with_timeout(
     token_env_var: str | None,
     timeout_sec: float | None,
 ) -> None:
-    if timeout_sec is None:
-        download_checkpoint_from_hf(
-            repo_id=repo_id,
-            revision=revision,
-            filenames=filenames,
-            dest_dir=dest_dir,
-            token_env_var=token_env_var,
-        )
-        return
-
-    # ThreadPoolExecutor lets us bound the wall-clock of the underlying call.
-    # The thread itself isn't cancellable (huggingface_hub uses requests under
-    # the hood), so on timeout we shutdown without waiting and leave the
-    # worker to unwind whenever its OS socket eventually closes.
-    ex = ThreadPoolExecutor(max_workers=1, thread_name_prefix="hf-chain-dl")
-    future = ex.submit(
-        download_checkpoint_from_hf,
+    download_checkpoint_from_hf_with_timeout(
         repo_id=repo_id,
         revision=revision,
         filenames=filenames,
         dest_dir=dest_dir,
-        token_env_var=token_env_var,
+        token_env_var=token_env_var or "HF_TOKEN",
+        timeout_sec=timeout_sec,
     )
-    try:
-        future.result(timeout=timeout_sec)
-    finally:
-        # wait=False: don't block on the orphan thread if the download is hung.
-        # cancel_futures=True is a no-op for an already-running future, but
-        # keeps the call symmetric for queued ones.
-        ex.shutdown(wait=False, cancel_futures=True)
 
 
 def grad_hook(name):

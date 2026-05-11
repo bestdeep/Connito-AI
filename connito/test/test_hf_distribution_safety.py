@@ -149,7 +149,7 @@ def test_fetch_model_skips_chain_checkpoint_without_hf_metadata(tmp_path, monkey
         lambda **kwargs: ChainCheckpoints(checkpoints=[chain_checkpoint]),
     )
     monkeypatch.setattr(
-        "connito.shared.model.download_checkpoint_from_hf",
+        "connito.shared.model.download_checkpoint_from_hf_with_timeout",
         lambda **kwargs: (_ for _ in ()).throw(AssertionError("HF should not be invoked when coords missing")),
     )
     monkeypatch.setattr("connito.shared.model.delete_old_checkpoints", lambda **kwargs: None)
