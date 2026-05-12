@@ -29,6 +29,7 @@ MODEL_BACKEND = "deepseek_v2"
 if MODEL_BACKEND == "deepseek_v2":
     from connito.shared.modeling.custom_deepseek_v2_lite import (
         CustomDeekSeekMoE as _CausalLMClass,
+        convert_full_to_partial_model as _convert_full_to_partial_impl,
         get_moe_model_config as _get_moe_model_config_impl,
     )
 
@@ -40,6 +41,10 @@ elif MODEL_BACKEND == "qwen3_next":
         CustomQwen3NextForCausalLM as _CausalLMClass,
         get_moe_model_config as _get_moe_model_config_impl,
     )
+    # qwen3_next backend has no full→partial weight port helper yet;
+    # `get_base_model(partial=True)` falls back to random init for this
+    # backend until one is added.
+    _convert_full_to_partial_impl = None
 
     def get_moe_model_config(config, topk, group_ids, expert_manager):
         return _get_moe_model_config_impl(config, topk, group_ids, expert_manager)
@@ -201,7 +206,50 @@ def get_base_model(
             model_dtype=model_dtype,
         )
     else:
+        # Partial path: a bare `_CausalLMClass(moe_config)` would leave every
+        # parameter at its random `_init_weights` default. Downstream
+        # `load_checkpoint` only restores the active expert group, so the
+        # backbone / embeddings / lm_head / attention / dense MLPs / shared
+        # experts would all stay random. Instead, load the full pretrained
+        # model and port its backbone (shape-match copy) plus the owned
+        # expert slices into the partial model, then free the full model.
         model = _CausalLMClass(moe_config)
+        if _convert_full_to_partial_impl is not None and group_ids:
+            target_group = group_ids[0]
+            full_moe_config = get_moe_model_config(
+                config,
+                config.moe.full_topk,
+                group_ids=None,
+                expert_manager=expert_manager,
+                full=True,
+            )
+            full_model = load_pretrained_model_low_mem(
+                model_class=_CausalLMClass,
+                model_path=config.model.model_path,
+                moe_config=full_moe_config,
+                model_dtype=model_dtype,
+            )
+            try:
+                model = _convert_full_to_partial_impl(
+                    partial_model=model,
+                    full_model=full_model,
+                    expert_group_assignment=expert_manager.expert_group_assignment,
+                    target_group=target_group,
+                )
+            finally:
+                del full_model
+                gc.collect()
+            logger.info(
+                "Loaded partial model with pretrained backbone + owned-expert slices",
+                target_group=target_group,
+            )
+        else:
+            logger.warning(
+                "Partial model returned with random weights — no full→partial port "
+                "helper available for this backend or `group_ids` missing",
+                backend=MODEL_BACKEND,
+                group_ids=group_ids,
+            )
 
     if model is not None and get_nested_attr(config, "model.torch_compile", False):
         model = torch.compile(model)
