@@ -235,10 +235,22 @@ def _cuda_mem_report(tag: str = "", device: int | None = None) -> None:
 
 
 def _install_signal_logging() -> None:
-    """Log SIGTERM / SIGINT / SIGHUP on receipt so docker-initiated kills are
-    visible in the validator log. We re-raise the default handler after logging
-    (default for SIGTERM/SIGHUP is to exit; SIGINT raises KeyboardInterrupt)
-    so the existing shutdown paths in run() still execute.
+    """Funnel SIGTERM / SIGHUP into the same `KeyboardInterrupt` path SIGINT
+    already takes, so docker-initiated stops run the existing shutdown block
+    in `run()` (background workers, chain_submitter, poller, averagers, …).
+
+    The previous implementation restored `SIG_DFL` and re-raised the signal.
+    For SIGTERM that meant "terminate immediately" with no Python exception —
+    the `except KeyboardInterrupt` / `except Exception` arms in `run()` never
+    fired, so nothing was stopped cleanly. Watchtower then timed out after 120s
+    and dockerd was left with a zombie PID 1 (orphaned hivemind libp2p +
+    background-worker threads, no init to reap them) which couldn't be removed.
+    Raising `KeyboardInterrupt` reuses the SIGINT shutdown path verbatim.
+
+    Caveat: if the main thread is parked inside a C extension when the signal
+    arrives (hivemind averager step, a torch op, etc.), the exception only
+    propagates once control returns to Python. The shutdown block itself still
+    needs per-step time bounds for that, but those are separate work.
     """
     def _handler(signum: int, frame) -> None:
         try:
@@ -246,13 +258,11 @@ def _install_signal_logging() -> None:
         except (ValueError, KeyError):
             name = str(signum)
         logger.warning(
-            "Validator received signal — process is being asked to stop",
+            "Validator received signal — initiating shutdown",
             signal=name,
             signum=signum,
         )
-        # Restore the default handler and re-raise so normal shutdown happens.
-        signal.signal(signum, signal.SIG_DFL)
-        os.kill(os.getpid(), signum)
+        raise KeyboardInterrupt
 
     for sig in (signal.SIGTERM, signal.SIGHUP):
         try:
