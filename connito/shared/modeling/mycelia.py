@@ -58,16 +58,29 @@ logger = structlog.get_logger(__name__)
 # ---------------------------------------------------------------------
 # Loading helpers
 # ---------------------------------------------------------------------
-def load_pretrained_state_dict(model_path: str) -> dict[str, torch.Tensor]:
-    """Load pretrained state dict from a HuggingFace model path (local or hub)."""
+def load_pretrained_state_dict(
+    model_path: str,
+    dtype: torch.dtype = torch.float32,
+) -> dict[str, torch.Tensor]:
+    """Load pretrained state dict from a HuggingFace model path (local or hub).
+
+    `dtype` selects the load-time tensor dtype. Default fp32 preserves
+    historical behavior; callers under memory pressure (e.g. the partial
+    loading path) should pass `torch.float16` / `torch.bfloat16` to halve
+    the host RAM footprint of the transient state dict."""
     from transformers import AutoModelForCausalLM
 
     hf_model = AutoModelForCausalLM.from_pretrained(
-        model_path, torch_dtype=torch.float32, low_cpu_mem_usage=True,
+        model_path, torch_dtype=dtype, low_cpu_mem_usage=True,
     )
     state_dict = hf_model.state_dict()
     del hf_model
-    logger.debug("Loaded pretrained state dict", path=model_path, num_keys=len(state_dict))
+    logger.debug(
+        "Loaded pretrained state dict",
+        path=model_path,
+        num_keys=len(state_dict),
+        dtype=str(dtype),
+    )
     return state_dict
 
 
@@ -83,9 +96,12 @@ def load_pretrained_model_low_mem(
             "Using direct explicit state_dict load for full model to avoid meta-tensor finalize issues",
             path=model_path,
         )
-        model = model_class(moe_config)
-        pretrained_sd = load_pretrained_state_dict(model_path)
+        # Build at `model_dtype` from the start: a fp32 default + later
+        # cast would peak at ~2x the final size for a 15B-param model.
+        model = model_class(moe_config).to(dtype=model_dtype)
+        pretrained_sd = load_pretrained_state_dict(model_path, dtype=model_dtype)
         model.load_state_dict(pretrained_sd, strict=False)
+        del pretrained_sd
         logger.info("Loaded full model via explicit state_dict", path=model_path, dtype=str(model_dtype))
         return model
 
@@ -112,9 +128,10 @@ def load_pretrained_model_low_mem(
         del model
         gc.collect()
 
-        model = model_class(moe_config)
-        pretrained_sd = load_pretrained_state_dict(model_path)
+        model = model_class(moe_config).to(dtype=model_dtype)
+        pretrained_sd = load_pretrained_state_dict(model_path, dtype=model_dtype)
         model.load_state_dict(pretrained_sd, strict=False)
+        del pretrained_sd
 
     logger.info("Loaded pretrained model directly", path=model_path, dtype=str(model_dtype))
     return model
