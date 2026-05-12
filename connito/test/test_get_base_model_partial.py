@@ -39,7 +39,11 @@ import torch
 from connito.shared.config import MinerConfig
 from connito.shared.expert_manager import ExpertManager
 from connito.shared.modeling.custom_deepseek_v2_lite import CustomDeekSeekMoE
-from connito.shared.modeling.mycelia import get_base_model, load_pretrained_state_dict
+from connito.shared.modeling.mycelia import (
+    get_base_model,
+    get_base_tokenizer,
+    load_pretrained_state_dict,
+)
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -60,7 +64,7 @@ def _build_config(group_id: int) -> MinerConfig:
     cfg.model.model_path = MODEL_PATH
     cfg.model.base_arch_model = MODEL_PATH
     cfg.model.device = "cpu"
-    cfg.model.precision = "fp16-mixed"
+    cfg.model.precision = "bf16-mixed"
     cfg.model.use_quantization = False
     cfg.model.use_unsloth = False
     cfg.model.torch_compile = False
@@ -170,6 +174,48 @@ def _compare_owned_experts(
     )
 
 
+def _run_forward_pass(
+    partial_model: CustomDeekSeekMoE,
+    config: MinerConfig,
+) -> None:
+    """Run a single CPU forward pass through the partial model.
+
+    This is a structural smoke test: the partial model only owns the
+    experts for one group, and `myceliaSparseMoeBlock` silently skips
+    tokens routed to unowned experts (`local_expert_idx == -1`), so
+    the resulting logits are only partially informed. We assert the
+    model is runnable end-to-end and produces a finite logits tensor
+    of the expected `(batch, seq, vocab)` shape — not that the output
+    is semantically meaningful."""
+    tokenizer = get_base_tokenizer(config)
+    prompt = "Hello, world!"
+    inputs = tokenizer(prompt, return_tensors="pt")
+    input_ids = inputs["input_ids"]
+    print(f"  prompt        = {prompt!r}")
+    print(f"  input_ids     = shape {tuple(input_ids.shape)}, dtype {input_ids.dtype}")
+
+    partial_model.eval()
+    with torch.no_grad():
+        outputs = partial_model(input_ids=input_ids)
+
+    logits = outputs.logits
+    print(f"  logits        = shape {tuple(logits.shape)}, dtype {logits.dtype}")
+
+    expected_shape = (
+        input_ids.shape[0],
+        input_ids.shape[1],
+        partial_model.config.vocab_size,
+    )
+    _assert(
+        tuple(logits.shape) == expected_shape,
+        f"logits shape is (batch, seq, vocab) = {expected_shape}",
+    )
+    _assert(
+        bool(torch.isfinite(logits).all().item()),
+        "all logits are finite (no NaN / Inf)",
+    )
+
+
 def _check_not_random(partial_state: dict) -> None:
     """Sanity: HuggingFace `_init_weights` for DeepSeek uses
     `normal_(std=config.initializer_range)` (~0.02). The pretrained
@@ -203,7 +249,7 @@ def main() -> int:
     print( "  device       = cpu (VRAM untouched)")
     print("=" * 72)
 
-    print("\n[1/4] Building MinerConfig + ExpertManager (real, from disk fixture)")
+    print("\n[1/5] Building MinerConfig + ExpertManager (real, from disk fixture)")
     config = _build_config(group_id=args.group_id)
     expert_manager = ExpertManager(config)
     n_groups = expert_manager.num_expert_groups
@@ -213,7 +259,7 @@ def main() -> int:
         f"expert_manager.expert_group_assignment contains group_id={args.group_id}",
     )
 
-    print("\n[2/4] Calling get_base_model(partial=True)")
+    print("\n[2/5] Calling get_base_model(partial=True)")
     partial_model = get_base_model(
         config=config,
         expert_manager=expert_manager,
@@ -229,12 +275,12 @@ def main() -> int:
     partial_state = partial_model.state_dict()
     print(f"  partial model state_dict keys: {len(partial_state)}")
 
-    print("\n[3/4] Sanity-check: weights are not at the random `_init_weights` default")
+    print("\n[3/5] Sanity-check: weights are not at the random `_init_weights` default")
     _check_not_random(partial_state)
 
-    print("\n[4/4] Comparing partial model tensors against the HF pretrained checkpoint")
-    print("  Loading pretrained state dict in fp16 on CPU (first run pulls ~16 GB)...")
-    full_state = load_pretrained_state_dict(MODEL_PATH, dtype=torch.float16)
+    print("\n[4/5] Comparing partial model tensors against the HF pretrained checkpoint")
+    print("  Loading pretrained state dict in bf16 on CPU (first run pulls ~16 GB)...")
+    full_state = load_pretrained_state_dict(MODEL_PATH, dtype=torch.bfloat16)
     print(f"  pretrained state dict keys: {len(full_state)}")
 
     print("\n  --- Backbone ---")
@@ -247,6 +293,13 @@ def main() -> int:
         expert_group_assignment=expert_manager.expert_group_assignment,
         target_group=args.group_id,
     )
+
+    # Free the pretrained state dict before the forward pass so peak RAM
+    # stays bounded — we no longer need it once comparisons are done.
+    del full_state
+
+    print("\n[5/5] Forward pass smoke test (CPU)")
+    _run_forward_pass(partial_model, config)
 
     print("\n" + "=" * 72)
     print("ALL CHECKS PASSED")
