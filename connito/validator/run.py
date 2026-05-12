@@ -335,10 +335,16 @@ def setup_training(
     # === model & Experts manager ===
     logger.debug("setup training - load model and expert manager")
     expert_manager = ExpertManager(config)
-    # global_model: partial model (only assigned experts) — used for optimization and evaluation
+    # global_model: partial model (only assigned experts) — used for optimization and evaluation.
+    # `load_global_checkpoint=False`: the validator boots from the pretrained
+    # backbone + experts (`get_base_model`) without overlaying any on-disk
+    # expert state. Peer-resync via `reload_model_inplace` still pulls the
+    # current pool state in the round loop; the optimizer/scaler/dataloader
+    # resume below is also independent of this flag.
     global_model, model_meta = load_model(
         rank, config, expert_manager, subtensor, wallet, current_model_meta,
         partial=True, checkpoint_device=device,
+        load_global_checkpoint=False,
     )
 
     # === optimizers ===

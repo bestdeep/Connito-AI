@@ -184,13 +184,20 @@ def freeze_parameters(
 def get_model_from_checkpoint(
     rank: int, config: MinerConfig | ValidatorConfig, expert_manager: ExpertManager, partial: bool = False,
     checkpoint_device: torch.device | None = None,
-) -> tuple[nn.Module, ModelCheckpoint]:
-    resume = get_nested_attr(config, "ckpt.resume_from_ckpt", False)
+    load_global_checkpoint: bool = True,
+) -> tuple[nn.Module, ModelCheckpoint | None]:
+    # `load_global_checkpoint=False` lets a caller (currently: the validator
+    # at cold start) build the base model without overlaying any on-disk
+    # expert state. The pretrained backbone + experts from `get_base_model`
+    # are returned as-is; mid-cycle peer resync via `reload_model_inplace`
+    # is unaffected.
+    resume = get_nested_attr(config, "ckpt.resume_from_ckpt", False) and load_global_checkpoint
     group_ids = [config.task.exp.group_id] if partial else None
     logger.info(
         "Loading base model for checkpoint",
         mode="partial" if partial else "full",
         group_ids=group_ids or "all",
+        load_global_checkpoint=load_global_checkpoint,
     )
     # get base model
     model = get_base_model(
@@ -200,6 +207,7 @@ def get_model_from_checkpoint(
         partial=partial,
     )
 
+    latest_checkpoint: ModelCheckpoint | None = None
     # load from checkpoint
     if resume:
         latest_checkpoint = select_best_checkpoint(
@@ -247,12 +255,17 @@ def load_model(
     current_checkpoint: ModelCheckpoint | None = None,
     partial: bool = False,
     checkpoint_device: torch.device | None = None,
-) -> tuple[nn.Module, dict]:
+    load_global_checkpoint: bool = True,
+) -> tuple[nn.Module, ModelCheckpoint | None]:
     """
     Main entry point used by miners (and potentially validator itself).
     1) Ask the chain for an active validator endpoint.
     2) If available, ping and fetch current model.
     3) Else, initialize a default model.
+
+    `load_global_checkpoint=False` skips the on-disk expert-state overlay
+    in `get_model_from_checkpoint` (the chain fetch above still runs so
+    future peer-resyncs have shards on disk).
     """
     # download new model from chain into file
 
@@ -271,7 +284,11 @@ def load_model(
         expert_group_assignment=expert_manager.expert_group_assignment
     )
 
-    return get_model_from_checkpoint(rank=rank, config=config, expert_manager=expert_manager, partial=partial, checkpoint_device=checkpoint_device)
+    return get_model_from_checkpoint(
+        rank=rank, config=config, expert_manager=expert_manager,
+        partial=partial, checkpoint_device=checkpoint_device,
+        load_global_checkpoint=load_global_checkpoint,
+    )
 
 
 def fetch_model_from_chain_validator(
