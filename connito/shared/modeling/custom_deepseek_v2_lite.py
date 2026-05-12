@@ -620,19 +620,66 @@ def convert_full_to_partial_model(
     return partial_model
 
 
+_EXPERT_PROJ_RE = re.compile(
+    r"^(.*\.mlp\.experts\.\d+\.)(gate_proj|up_proj|down_proj)\.weight$"
+)
+
+
 def _apply_pretrained_tensor_to_partial(
     key: str,
     source_tensor: torch.Tensor,
     partial_state: dict[str, torch.Tensor],
     assignments: dict[int, list[tuple[int, int]]],
     loaded_counts: dict[str, int],
+    gate_up_buf: dict[str, dict[str, torch.Tensor]] | None = None,
 ) -> None:
     """Route one pretrained `(key, tensor)` into `partial_state` via the
     same logic as `convert_full_to_partial_model`: backbone shape-match
     copy, MoE gate row-slicing, or expert tensor slicing. Mutates
     `partial_state` (via destination `.copy_` / indexed assignment) and
-    `loaded_counts` in place."""
+    `loaded_counts` in place.
+
+    Also handles raw deepseek MoE per-expert keys:
+      `model.layers.{L}.mlp.experts.{global_id}.{gate_proj|up_proj|down_proj}.weight`
+    by routing into partial_state's fused `gate_up_proj` (concat gate+up
+    along intermediate dim) and `down_proj` per-expert slices. Uses
+    `gate_up_buf` to defer fusion until both `gate_proj` and `up_proj`
+    arrive for the same expert. Shared_experts keys keep their `.weight`
+    suffix in both src and partial so they hit the standard shape-match
+    path; this case only catches the routed-experts mismatch."""
     if key not in partial_state:
+        # Try per-expert routed-experts conversion.
+        m = _EXPERT_PROJ_RE.match(key)
+        if m is not None:
+            expert_prefix = m.group(1)   # `model.layers.L.mlp.experts.N.`
+            proj_name = m.group(2)
+
+            if proj_name == "down_proj":
+                target_key = expert_prefix + "down_proj"
+                if target_key in partial_state:
+                    dst = partial_state[target_key]
+                    dst.copy_(source_tensor.to(device=dst.device, dtype=dst.dtype))
+                    loaded_counts["sliced"] += 1
+                return
+
+            # gate_proj or up_proj — fuse with its pair via gate_up_buf.
+            target_key = expert_prefix + "gate_up_proj"
+            if target_key not in partial_state:
+                return  # expert not owned by this group
+            if gate_up_buf is None:
+                return  # caller did not supply buffer; can't fuse safely
+            slot = gate_up_buf.setdefault(expert_prefix, {})
+            slot[proj_name] = source_tensor
+            if "gate_proj" in slot and "up_proj" in slot:
+                gate = slot.pop("gate_proj")
+                up = slot.pop("up_proj")
+                fused = torch.cat([gate, up], dim=0)
+                dst = partial_state[target_key]
+                dst.copy_(fused.to(device=dst.device, dtype=dst.dtype))
+                loaded_counts["sliced"] += 1
+                if not slot:
+                    gate_up_buf.pop(expert_prefix, None)
+            return
         return
     dst_tensor = partial_state[key]
 
@@ -710,6 +757,7 @@ def stream_pretrained_state_dict_to_partial_model(
     partial_state = partial_model.state_dict()
     assignments = expert_group_assignment.get(target_group, {})
     loaded_counts = {"full": 0, "sliced": 0}
+    gate_up_buf: dict[str, dict[str, torch.Tensor]] = {}
 
     for key in list(state_dict.keys()):
         source_tensor = state_dict.pop(key)
@@ -719,6 +767,7 @@ def stream_pretrained_state_dict_to_partial_model(
             partial_state=partial_state,
             assignments=assignments,
             loaded_counts=loaded_counts,
+            gate_up_buf=gate_up_buf,
         )
 
     partial_model.load_state_dict(partial_state, strict=False)
@@ -783,6 +832,7 @@ def stream_safetensors_to_partial_model(
     partial_state = partial_model.state_dict()
     assignments = expert_group_assignment.get(target_group, {})
     loaded_counts = {"full": 0, "sliced": 0}
+    gate_up_buf: dict[str, dict[str, torch.Tensor]] = {}
 
     for shard_filename in shard_filenames:
         shard_path = cached_file(model_path, shard_filename)
@@ -797,6 +847,7 @@ def stream_safetensors_to_partial_model(
                     partial_state=partial_state,
                     assignments=assignments,
                     loaded_counts=loaded_counts,
+                    gate_up_buf=gate_up_buf,
                 )
                 del source_tensor
         # Drop the shard's file handle + force a GC sweep so the OS can
