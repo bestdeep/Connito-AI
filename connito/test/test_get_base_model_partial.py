@@ -7,13 +7,16 @@ owned-expert tensors match the pretrained checkpoint instead of the
 random `_init_weights` default.
 
 CPU-only — every weight load and tensor comparison runs in host RAM.
-VRAM is never touched. The partial model produced by `get_base_model`
-stays on CPU at construction time (the validator's main loop is what
-moves it to `config.model.device` later, not this script).
+VRAM is never touched: the script sets `config.model.device = "cpu"`,
+so `get_base_model` keeps the partial model on CPU and the pretrained
+state dict is also loaded on CPU (production miners with a real GPU
+would land the partial model in VRAM instead, leaving the CPU state
+dict to drain into VRAM tensor-by-tensor as it streams).
 
-No mocks. Heavy — peak ~32 GB RAM during `get_base_model`'s internal
-full→partial port, then ~19 GB during the verification compare. First
-run pulls ~16 GB from HuggingFace; subsequent runs reuse the HF cache.
+No mocks. Heavy — peak ~40 GB RAM during the streaming load
+(partial model + the still-being-consumed pretrained state dict),
+and another ~40 GB peak during the verification compare. First run
+pulls ~16 GB from HuggingFace; subsequent runs reuse the HF cache.
 
 Run from the repo root:
 

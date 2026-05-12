@@ -29,8 +29,8 @@ MODEL_BACKEND = "deepseek_v2"
 if MODEL_BACKEND == "deepseek_v2":
     from connito.shared.modeling.custom_deepseek_v2_lite import (
         CustomDeekSeekMoE as _CausalLMClass,
-        convert_full_to_partial_model as _convert_full_to_partial_impl,
         get_moe_model_config as _get_moe_model_config_impl,
+        stream_pretrained_state_dict_to_partial_model as _stream_pretrained_to_partial_impl,
     )
 
     def get_moe_model_config(config, topk, group_ids, expert_manager, full = False):
@@ -41,10 +41,10 @@ elif MODEL_BACKEND == "qwen3_next":
         CustomQwen3NextForCausalLM as _CausalLMClass,
         get_moe_model_config as _get_moe_model_config_impl,
     )
-    # qwen3_next backend has no full→partial weight port helper yet;
+    # qwen3_next backend has no full→partial streaming helper yet;
     # `get_base_model(partial=True)` falls back to random init for this
     # backend until one is added.
-    _convert_full_to_partial_impl = None
+    _stream_pretrained_to_partial_impl = None
 
     def get_moe_model_config(config, topk, group_ids, expert_manager):
         return _get_moe_model_config_impl(config, topk, group_ids, expert_manager)
@@ -227,43 +227,55 @@ def get_base_model(
         # parameter at its random `_init_weights` default. Downstream
         # `load_checkpoint` only restores the active expert group, so the
         # backbone / embeddings / lm_head / attention / dense MLPs / shared
-        # experts would all stay random. Instead, load the full pretrained
-        # model and port its backbone (shape-match copy) plus the owned
-        # expert slices into the partial model, then free the full model.
-        model = _CausalLMClass(moe_config)
-        if _convert_full_to_partial_impl is not None and group_ids:
-            target_group = group_ids[0]
-            full_moe_config = get_moe_model_config(
-                config,
-                config.moe.full_topk,
-                group_ids=None,
-                expert_manager=expert_manager,
-                full=True,
+        # experts would all stay random.
+        #
+        # Strategy (keeps peak memory bounded for DeepSeek-V2-Lite — the
+        # earlier "build full model on CPU + convert" approach peaked at
+        # ~76 GB host RAM):
+        #   1. Build the partial model and move it to its target device
+        #      (typically GPU) at `model_dtype` before any pretrained data
+        #      is loaded. Partial parameters live in VRAM; host RAM for
+        #      the partial model returns to 0.
+        #   2. Load the full pretrained *state dict* on CPU at
+        #      `model_dtype` — never materialize a full pretrained model.
+        #   3. Stream tensors from the CPU state dict into the partial
+        #      model (with backbone shape-match + owned-expert slicing),
+        #      popping each entry as it lands so host RAM drops
+        #      monotonically through the loop.
+        target_device = getattr(config.model, "device", "cpu")
+        if target_device == "cuda" and not torch.cuda.is_available():
+            logger.warning(
+                "config.model.device='cuda' but CUDA not available; keeping partial model on CPU",
             )
-            full_model = load_pretrained_model_low_mem(
-                model_class=_CausalLMClass,
-                model_path=config.model.model_path,
-                moe_config=full_moe_config,
-                model_dtype=model_dtype,
+            target_device = "cpu"
+
+        model = _CausalLMClass(moe_config)
+        if _stream_pretrained_to_partial_impl is not None and group_ids:
+            target_group = group_ids[0]
+            model = model.to(device=target_device, dtype=model_dtype)
+            pretrained_sd = load_pretrained_state_dict(
+                config.model.model_path, dtype=model_dtype,
             )
             try:
-                model = _convert_full_to_partial_impl(
+                model = _stream_pretrained_to_partial_impl(
                     partial_model=model,
-                    full_model=full_model,
+                    state_dict=pretrained_sd,
                     expert_group_assignment=expert_manager.expert_group_assignment,
                     target_group=target_group,
                 )
             finally:
-                del full_model
+                del pretrained_sd
                 gc.collect()
             logger.info(
-                "Loaded partial model with pretrained backbone + owned-expert slices",
+                "Streamed pretrained backbone + owned-expert slices into partial model",
                 target_group=target_group,
+                device=str(target_device),
+                dtype=str(model_dtype),
             )
         else:
             logger.warning(
-                "Partial model returned with random weights — no full→partial port "
-                "helper available for this backend or `group_ids` missing",
+                "Partial model returned with random weights — no pretrained-state-dict "
+                "streaming helper available for this backend or `group_ids` missing",
                 backend=MODEL_BACKEND,
                 group_ids=group_ids,
             )

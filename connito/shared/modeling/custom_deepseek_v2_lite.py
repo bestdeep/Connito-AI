@@ -619,6 +619,96 @@ def convert_full_to_partial_model(
     return partial_model
 
 
+def stream_pretrained_state_dict_to_partial_model(
+    partial_model: CustomDeekSeekMoE,
+    state_dict: dict[str, torch.Tensor],
+    expert_group_assignment: dict[int, dict[int, list[tuple[int, int]]]],
+    target_group: int,
+) -> CustomDeekSeekMoE:
+    """Stream a pretrained state dict into a partial model, popping
+    each source entry from `state_dict` as it lands so its host RAM is
+    released before the next tensor is processed.
+
+    Replicates `convert_full_to_partial_model`'s per-key logic
+    (backbone shape-match, MoE gate slicing, expert tensor slicing)
+    but does not require a full pretrained model to be materialized.
+    Combined with placing `partial_model` on its target device (GPU)
+    *before* this call, the working sets of the pretrained tensors
+    (CPU) and the partial parameters (GPU) live in separate memory
+    pools, avoiding the previous full+partial-on-CPU peak.
+
+    The caller's `state_dict` is consumed: it ends empty.
+    """
+    partial_state = partial_model.state_dict()
+    assignments = expert_group_assignment.get(target_group, {})
+    loaded_counts = {"full": 0, "sliced": 0}
+
+    for key in list(state_dict.keys()):
+        source_tensor = state_dict.pop(key)
+
+        if key not in partial_state:
+            continue
+        dst_tensor = partial_state[key]
+
+        if tuple(source_tensor.shape) == tuple(dst_tensor.shape):
+            dst_tensor.copy_(
+                source_tensor.to(device=dst_tensor.device, dtype=dst_tensor.dtype)
+            )
+            loaded_counts["full"] += 1
+            continue
+
+        layer_idx, _ = get_layer_expert_id(key)
+        if layer_idx is None:
+            continue
+
+        if ".mlp.gate.weight" in key and source_tensor.ndim == 2:
+            layer_map = assignments.get(layer_idx, [])
+            if not layer_map:
+                continue
+            for my_expert_id, org_expert_id in layer_map:
+                if my_expert_id < dst_tensor.shape[0] and org_expert_id < source_tensor.shape[0]:
+                    dst_tensor[my_expert_id] = source_tensor[org_expert_id].to(
+                        device=dst_tensor.device, dtype=dst_tensor.dtype
+                    )
+                    loaded_counts["sliced"] += 1
+            continue
+
+        if ".mlp.experts." in key and source_tensor.ndim >= 2:
+            layer_assignments = assignments.get(layer_idx, [])
+            valid_src_indices: list[int] = []
+            valid_dst_indices: list[int] = []
+            for dst_local_idx, org_expert_id in layer_assignments:
+                org_expert_id = int(org_expert_id)
+                dst_local_idx = int(dst_local_idx)
+                if 0 <= org_expert_id < source_tensor.shape[0]:
+                    valid_src_indices.append(org_expert_id)
+                    valid_dst_indices.append(dst_local_idx)
+            if not valid_src_indices:
+                continue
+            extracted = source_tensor[valid_src_indices]
+            target_slice_shape = dst_tensor[valid_dst_indices].shape
+            if tuple(extracted.shape) != tuple(target_slice_shape):
+                logger.warning(
+                    "Skipping expert slice due to shape mismatch",
+                    key=key,
+                    source_shape=tuple(extracted.shape),
+                    target_shape=tuple(target_slice_shape),
+                )
+                continue
+            dst_tensor[valid_dst_indices] = extracted.to(
+                device=dst_tensor.device, dtype=dst_tensor.dtype
+            )
+            loaded_counts["sliced"] += 1
+
+    partial_model.load_state_dict(partial_state, strict=False)
+    logger.info(
+        "Streamed pretrained state dict into partial model",
+        loaded_counts=loaded_counts,
+        target_group=target_group,
+    )
+    return partial_model
+
+
 def get_moe_model_config(
     config: MinerConfig,
     topk: int,
