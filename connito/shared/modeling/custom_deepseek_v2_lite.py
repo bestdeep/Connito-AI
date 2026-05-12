@@ -11,6 +11,7 @@ from transformers import (
     PretrainedConfig,
 )
 from transformers.utils import (
+    SAFE_WEIGHTS_INDEX_NAME,
     SAFE_WEIGHTS_NAME,
     WEIGHTS_NAME,
     cached_file,
@@ -619,6 +620,73 @@ def convert_full_to_partial_model(
     return partial_model
 
 
+def _apply_pretrained_tensor_to_partial(
+    key: str,
+    source_tensor: torch.Tensor,
+    partial_state: dict[str, torch.Tensor],
+    assignments: dict[int, list[tuple[int, int]]],
+    loaded_counts: dict[str, int],
+) -> None:
+    """Route one pretrained `(key, tensor)` into `partial_state` via the
+    same logic as `convert_full_to_partial_model`: backbone shape-match
+    copy, MoE gate row-slicing, or expert tensor slicing. Mutates
+    `partial_state` (via destination `.copy_` / indexed assignment) and
+    `loaded_counts` in place."""
+    if key not in partial_state:
+        return
+    dst_tensor = partial_state[key]
+
+    if tuple(source_tensor.shape) == tuple(dst_tensor.shape):
+        dst_tensor.copy_(
+            source_tensor.to(device=dst_tensor.device, dtype=dst_tensor.dtype)
+        )
+        loaded_counts["full"] += 1
+        return
+
+    layer_idx, _ = get_layer_expert_id(key)
+    if layer_idx is None:
+        return
+
+    if ".mlp.gate.weight" in key and source_tensor.ndim == 2:
+        layer_map = assignments.get(layer_idx, [])
+        if not layer_map:
+            return
+        for my_expert_id, org_expert_id in layer_map:
+            if my_expert_id < dst_tensor.shape[0] and org_expert_id < source_tensor.shape[0]:
+                dst_tensor[my_expert_id] = source_tensor[org_expert_id].to(
+                    device=dst_tensor.device, dtype=dst_tensor.dtype
+                )
+                loaded_counts["sliced"] += 1
+        return
+
+    if ".mlp.experts." in key and source_tensor.ndim >= 2:
+        layer_assignments = assignments.get(layer_idx, [])
+        valid_src_indices: list[int] = []
+        valid_dst_indices: list[int] = []
+        for dst_local_idx, org_expert_id in layer_assignments:
+            org_expert_id = int(org_expert_id)
+            dst_local_idx = int(dst_local_idx)
+            if 0 <= org_expert_id < source_tensor.shape[0]:
+                valid_src_indices.append(org_expert_id)
+                valid_dst_indices.append(dst_local_idx)
+        if not valid_src_indices:
+            return
+        extracted = source_tensor[valid_src_indices]
+        target_slice_shape = dst_tensor[valid_dst_indices].shape
+        if tuple(extracted.shape) != tuple(target_slice_shape):
+            logger.warning(
+                "Skipping expert slice due to shape mismatch",
+                key=key,
+                source_shape=tuple(extracted.shape),
+                target_shape=tuple(target_slice_shape),
+            )
+            return
+        dst_tensor[valid_dst_indices] = extracted.to(
+            device=dst_tensor.device, dtype=dst_tensor.dtype
+        )
+        loaded_counts["sliced"] += 1
+
+
 def stream_pretrained_state_dict_to_partial_model(
     partial_model: CustomDeekSeekMoE,
     state_dict: dict[str, torch.Tensor],
@@ -645,66 +713,102 @@ def stream_pretrained_state_dict_to_partial_model(
 
     for key in list(state_dict.keys()):
         source_tensor = state_dict.pop(key)
-
-        if key not in partial_state:
-            continue
-        dst_tensor = partial_state[key]
-
-        if tuple(source_tensor.shape) == tuple(dst_tensor.shape):
-            dst_tensor.copy_(
-                source_tensor.to(device=dst_tensor.device, dtype=dst_tensor.dtype)
-            )
-            loaded_counts["full"] += 1
-            continue
-
-        layer_idx, _ = get_layer_expert_id(key)
-        if layer_idx is None:
-            continue
-
-        if ".mlp.gate.weight" in key and source_tensor.ndim == 2:
-            layer_map = assignments.get(layer_idx, [])
-            if not layer_map:
-                continue
-            for my_expert_id, org_expert_id in layer_map:
-                if my_expert_id < dst_tensor.shape[0] and org_expert_id < source_tensor.shape[0]:
-                    dst_tensor[my_expert_id] = source_tensor[org_expert_id].to(
-                        device=dst_tensor.device, dtype=dst_tensor.dtype
-                    )
-                    loaded_counts["sliced"] += 1
-            continue
-
-        if ".mlp.experts." in key and source_tensor.ndim >= 2:
-            layer_assignments = assignments.get(layer_idx, [])
-            valid_src_indices: list[int] = []
-            valid_dst_indices: list[int] = []
-            for dst_local_idx, org_expert_id in layer_assignments:
-                org_expert_id = int(org_expert_id)
-                dst_local_idx = int(dst_local_idx)
-                if 0 <= org_expert_id < source_tensor.shape[0]:
-                    valid_src_indices.append(org_expert_id)
-                    valid_dst_indices.append(dst_local_idx)
-            if not valid_src_indices:
-                continue
-            extracted = source_tensor[valid_src_indices]
-            target_slice_shape = dst_tensor[valid_dst_indices].shape
-            if tuple(extracted.shape) != tuple(target_slice_shape):
-                logger.warning(
-                    "Skipping expert slice due to shape mismatch",
-                    key=key,
-                    source_shape=tuple(extracted.shape),
-                    target_shape=tuple(target_slice_shape),
-                )
-                continue
-            dst_tensor[valid_dst_indices] = extracted.to(
-                device=dst_tensor.device, dtype=dst_tensor.dtype
-            )
-            loaded_counts["sliced"] += 1
+        _apply_pretrained_tensor_to_partial(
+            key=key,
+            source_tensor=source_tensor,
+            partial_state=partial_state,
+            assignments=assignments,
+            loaded_counts=loaded_counts,
+        )
 
     partial_model.load_state_dict(partial_state, strict=False)
     logger.info(
         "Streamed pretrained state dict into partial model",
         loaded_counts=loaded_counts,
         target_group=target_group,
+    )
+    return partial_model
+
+
+def stream_safetensors_to_partial_model(
+    partial_model: CustomDeekSeekMoE,
+    model_path: str,
+    expert_group_assignment: dict[int, dict[int, list[tuple[int, int]]]],
+    target_group: int,
+    dtype: torch.dtype,
+) -> CustomDeekSeekMoE:
+    """Stream a pretrained checkpoint directly from its safetensors shards
+    into `partial_model`, materializing one source tensor at a time
+    instead of holding the full state dict in host RAM.
+
+    Peak host RAM is bounded by one shard's file-backed mmap (~6 GB for
+    DeepSeek-V2-Lite, reclaimable by the kernel under pressure) plus a
+    single materialized source tensor. Compared to
+    `load_pretrained_state_dict` + `stream_pretrained_state_dict_to_partial_model`,
+    this avoids holding the entire ~30 GB state dict on CPU during
+    validator/miner startup.
+
+    `model_path` may be a local directory or an HF hub repo id;
+    `cached_file` resolves either.
+    """
+    import gc
+    import json
+
+    from safetensors import safe_open
+
+    index_path = cached_file(
+        model_path,
+        SAFE_WEIGHTS_INDEX_NAME,
+        _raise_exceptions_for_missing_entries=False,
+    )
+    if index_path is not None:
+        with open(index_path, "r") as fh:
+            index = json.load(fh)
+        weight_map = index["weight_map"]
+        shard_filenames = sorted(set(weight_map.values()))
+    else:
+        # Single-file (non-sharded) checkpoint.
+        single_path = cached_file(
+            model_path,
+            SAFE_WEIGHTS_NAME,
+            _raise_exceptions_for_missing_entries=False,
+        )
+        if single_path is None:
+            raise FileNotFoundError(
+                f"No safetensors files found for model_path={model_path!r} "
+                f"(looked for {SAFE_WEIGHTS_INDEX_NAME} and {SAFE_WEIGHTS_NAME})",
+            )
+        shard_filenames = [SAFE_WEIGHTS_NAME]
+
+    partial_state = partial_model.state_dict()
+    assignments = expert_group_assignment.get(target_group, {})
+    loaded_counts = {"full": 0, "sliced": 0}
+
+    for shard_filename in shard_filenames:
+        shard_path = cached_file(model_path, shard_filename)
+        with safe_open(shard_path, framework="pt", device="cpu") as shard:
+            for key in shard.keys():
+                source_tensor = shard.get_tensor(key)
+                if source_tensor.dtype != dtype:
+                    source_tensor = source_tensor.to(dtype=dtype)
+                _apply_pretrained_tensor_to_partial(
+                    key=key,
+                    source_tensor=source_tensor,
+                    partial_state=partial_state,
+                    assignments=assignments,
+                    loaded_counts=loaded_counts,
+                )
+                del source_tensor
+        # Drop the shard's file handle + force a GC sweep so the OS can
+        # reclaim file-backed pages before the next shard is mapped.
+        gc.collect()
+
+    partial_model.load_state_dict(partial_state, strict=False)
+    logger.info(
+        "Streamed pretrained safetensors shards into partial model",
+        loaded_counts=loaded_counts,
+        target_group=target_group,
+        shards=len(shard_filenames),
     )
     return partial_model
 

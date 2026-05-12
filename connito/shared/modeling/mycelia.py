@@ -31,6 +31,7 @@ if MODEL_BACKEND == "deepseek_v2":
         CustomDeekSeekMoE as _CausalLMClass,
         get_moe_model_config as _get_moe_model_config_impl,
         stream_pretrained_state_dict_to_partial_model as _stream_pretrained_to_partial_impl,
+        stream_safetensors_to_partial_model as _stream_safetensors_to_partial_impl,
     )
 
     def get_moe_model_config(config, topk, group_ids, expert_manager, full = False):
@@ -45,6 +46,7 @@ elif MODEL_BACKEND == "qwen3_next":
     # `get_base_model(partial=True)` falls back to random init for this
     # backend until one is added.
     _stream_pretrained_to_partial_impl = None
+    _stream_safetensors_to_partial_impl = None
 
     def get_moe_model_config(config, topk, group_ids, expert_manager):
         return _get_moe_model_config_impl(config, topk, group_ids, expert_manager)
@@ -236,12 +238,15 @@ def get_base_model(
         #      (typically GPU) at `model_dtype` before any pretrained data
         #      is loaded. Partial parameters live in VRAM; host RAM for
         #      the partial model returns to 0.
-        #   2. Load the full pretrained *state dict* on CPU at
-        #      `model_dtype` — never materialize a full pretrained model.
-        #   3. Stream tensors from the CPU state dict into the partial
-        #      model (with backbone shape-match + owned-expert slicing),
-        #      popping each entry as it lands so host RAM drops
-        #      monotonically through the loop.
+        #   2. Open each safetensors shard directly via `safe_open` and
+        #      stream one tensor at a time into the partial model,
+        #      slicing owned experts in the same per-key pass. The full
+        #      state dict is never materialized in CPU RAM, so host RAM
+        #      stays bounded by a single shard's file-backed mmap
+        #      (~6 GB) plus one materialized tensor.
+        #   3. Fall back to `load_pretrained_state_dict` + in-RAM
+        #      streaming only if the safetensors-direct path is not
+        #      available for the current backend.
         target_device = getattr(config.model, "device", "cpu")
         if target_device == "cuda" and not torch.cuda.is_available():
             logger.warning(
@@ -250,7 +255,28 @@ def get_base_model(
             target_device = "cpu"
 
         model = _CausalLMClass(moe_config)
-        if _stream_pretrained_to_partial_impl is not None and group_ids:
+        if _stream_safetensors_to_partial_impl is not None and group_ids:
+            target_group = group_ids[0]
+            model = model.to(device=target_device, dtype=model_dtype)
+            model = _stream_safetensors_to_partial_impl(
+                partial_model=model,
+                model_path=config.model.model_path,
+                expert_group_assignment=expert_manager.expert_group_assignment,
+                target_group=target_group,
+                dtype=model_dtype,
+            )
+            gc.collect()
+            logger.info(
+                "Streamed pretrained safetensors directly into partial model",
+                target_group=target_group,
+                device=str(target_device),
+                dtype=str(model_dtype),
+            )
+        elif _stream_pretrained_to_partial_impl is not None and group_ids:
+            # Backend has a state-dict streaming helper but no
+            # safetensors-direct path. Higher CPU peak (~30 GB for
+            # DeepSeek-V2-Lite) but still better than the legacy
+            # full-model-on-CPU approach.
             target_group = group_ids[0]
             model = model.to(device=target_device, dtype=model_dtype)
             pretrained_sd = load_pretrained_state_dict(
