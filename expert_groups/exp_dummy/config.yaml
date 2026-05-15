@@ -10,7 +10,7 @@ data:
       name: "4plus"
       weight: 0.5
       text_column: "text"
-  batch_size: 1 
+  batch_size: 4 
   sequence_length: 100
   world_size: 10 # TODO: approximately how many miners are out there
   rank: 1 # TODO: based on your uid

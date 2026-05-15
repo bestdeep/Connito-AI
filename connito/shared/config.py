@@ -27,8 +27,22 @@ logger = structlog.get_logger(__name__)
 # Utilities
 # ---------------------------
 def is_running_in_docker() -> bool:
-    """Return True if we are inside a Docker container."""
-    return Path("/.dockerenv").exists()
+    """Return True iff we're inside the Connito container with its bind mounts.
+
+    Plain `/.dockerenv` exists in every Docker-based environment (Cursor Cloud
+    dev images, Codespaces, generic CI containers, etc.) and is too coarse a
+    signal for "remap root_path to /data and task.base_path to
+    /app/expert_groups". The remap only makes sense when the validator image
+    is started from `connito/validator/docker/docker-compose.yml`, which
+    provides those bind mounts. Require them to actually exist so generic
+    containers fall through to the host-style layout (find_project_root +
+    relative `expert_groups/`).
+    """
+    return (
+        Path("/.dockerenv").exists()
+        and Path("/data").is_dir()
+        and Path("/app/expert_groups").is_dir()
+    )
 
 
 def find_project_root(start: Path | None = None) -> Path:

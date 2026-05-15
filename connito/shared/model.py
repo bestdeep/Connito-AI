@@ -25,7 +25,11 @@ from connito.shared.checkpoints import (
     select_best_checkpoint,
 )
 from connito.shared.config import MinerConfig, ValidatorConfig, WorkerConfig
-from connito.shared.hf_distribute import download_checkpoint_from_hf_with_timeout
+from connito.shared.hf_distribute import (
+    _resolve_token,
+    download_checkpoint_from_hf_with_timeout,
+)
+from huggingface_hub import HfApi
 from connito.shared.cycle import (
     PhaseNames,
     get_blocks_from_previous_phase_from_api,
@@ -44,11 +48,59 @@ from connito.shared.schema import verify_message
 logger = structlog.get_logger(__name__)
 
 
-def _build_download_targets(expert_group_ids: list[int | str]) -> list[tuple[int | str, str]]:
+def _build_download_targets(
+    expert_group_ids: list[int | str],
+    *,
+    repo_id: str | None = None,
+    revision: str | None = None,
+    token_env_var: str | None = None,
+) -> list[tuple[int | str, str]]:
+    """Resolve which `model_expgroup_<id>.<ext>` files to fetch from a repo.
+
+    Modern miners/validators upload `.safetensors` (no pickle exec surface,
+    deterministic byte layout used for the on-chain hash); legacy uploads only
+    have `.pt`. We pre-flight `list_repo_files` and prefer `.safetensors`,
+    falling back to `.pt` only when the repo has no safetensors shard. If the
+    listing call fails (private repo / network blip / API hiccup), we fall back
+    to the legacy `.pt` filename so behavior is no worse than before.
+    """
+    available: set[str] | None = None
+    if repo_id and revision:
+        try:
+            token = _resolve_token(None, token_env_var or "HF_TOKEN")
+            available = set(
+                HfApi(token=token).list_repo_files(repo_id=repo_id, revision=revision)
+            )
+        except Exception as e:
+            logger.warning(
+                "Could not list HF repo files for download target resolution; "
+                "falling back to legacy .pt-only behavior",
+                repo_id=repo_id,
+                revision=revision,
+                error=str(e),
+            )
+
     targets: list[tuple[int | str, str]] = []
     for expert_group_id in expert_group_ids:
         if isinstance(expert_group_id, int):
-            targets.append((expert_group_id, f"model_expgroup_{expert_group_id}.pt"))
+            safetensors_name = f"model_expgroup_{expert_group_id}.safetensors"
+            pt_name = f"model_expgroup_{expert_group_id}.pt"
+            if available is None:
+                # Listing failed or wasn't requested — keep legacy behavior.
+                chosen = pt_name
+            elif safetensors_name in available:
+                chosen = safetensors_name
+            elif pt_name in available:
+                chosen = pt_name
+            else:
+                logger.warning(
+                    "No model_expgroup shard found in repo for either extension; skipping",
+                    expert_group=expert_group_id,
+                    repo_id=repo_id,
+                    revision=revision,
+                )
+                continue
+            targets.append((expert_group_id, chosen))
         elif expert_group_id == "shared":
             # `model_shared` is no longer persisted or distributed; backbone state
             # is reconstructed from `config.model.model_path` at instantiation.
@@ -370,17 +422,25 @@ def fetch_model_from_chain_validator(
                 )
                 out_folder.mkdir(parents=True, exist_ok=True)
 
-                targets = _build_download_targets(expert_group_ids)
-                filenames = [filename for _, filename in targets]
-                if not filenames:
-                    continue
-
                 if not (chain_checkpoint.hf_repo_id and chain_checkpoint.hf_revision):
                     logger.warning(
                         "Chain checkpoint missing HF coordinates; skipping",
                         uid=chain_checkpoint.uid,
                         hotkey=chain_checkpoint.hotkey,
                     )
+                    continue
+
+                # Resolve filenames AFTER we know we have HF coords, so we can
+                # pre-flight the actual repo and prefer `.safetensors` over the
+                # legacy `.pt` shard whenever the new format is published.
+                targets = _build_download_targets(
+                    expert_group_ids,
+                    repo_id=chain_checkpoint.hf_repo_id,
+                    revision=chain_checkpoint.hf_revision,
+                    token_env_var=config.hf.token_env_var,
+                )
+                filenames = [filename for _, filename in targets]
+                if not filenames:
                     continue
 
                 _clear_download_targets(out_folder, filenames)
