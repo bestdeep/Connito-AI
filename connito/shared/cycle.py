@@ -570,6 +570,12 @@ def get_combined_validator_seed(
     if not block_hash:
         block_hash = ""
 
+    logger.info(
+        "Combined validator seed inputs",
+        validator_seeds=validator_seeds,
+        block_hash=block_hash,
+    )
+
     # Validator-committed component: deterministic from sorted seeds.
     # May be empty during the transition before all operators have
     # upgraded; in that state the block-hash component (when present)
