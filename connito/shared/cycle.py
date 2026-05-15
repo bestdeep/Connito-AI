@@ -544,11 +544,15 @@ def get_combined_validator_seed(
     can be removed in a follow-up that drops the `miner_seed` chain-
     commit field entirely.
 
-    Both sources are required: if either is unavailable, the function
-    raises `RuntimeError` rather than falling back to a value that
-    could be predicted. Returning `sha256(b"0")` (the prior fallback)
-    is itself a predictability vulnerability — a miner who forces an
-    empty-seeds state lands on a known seed and can pre-overfit.
+    If `block_hash` is unavailable (phase API or chain RPC failure),
+    fall back to using an empty string for that component — the cycle
+    continues with only the validator-committed seeds contributing
+    entropy (equivalent to pre-PR security level for that cycle).
+    A follow-up PR will tighten this: the combined "no committed
+    seeds AND no block_hash" case still produces sha256("") which is
+    publicly known; that needs a hard guard. Left as a known
+    deficiency for now per the reviewer's preference to keep the
+    program running through transient failures.
 
     We sort validator IDs so the result is independent of dict iteration order.
 
@@ -563,21 +567,13 @@ def get_combined_validator_seed(
 
     validator_seeds = get_validator_seed_from_commit(config, commits)
     block_hash = _get_minercommit2_block_hash(config, subtensor)
-
-    # Block hash is the security floor: without it, the combined seed
-    # is reducible to publicly-committed `miner_seed` values, which
-    # miners can read. Raise rather than fall through.
     if not block_hash:
-        raise RuntimeError(
-            "Unable to derive block-hash component of combined validator seed "
-            "(phase API or chain RPC unavailable). Refusing to fall back to a "
-            "predictable seed — round cannot proceed."
-        )
+        block_hash = ""
 
     # Validator-committed component: deterministic from sorted seeds.
-    # Allowed to be empty during the transition before all operators
-    # have upgraded (in which case only the block-hash component
-    # contributes entropy, which is still unpredictable to miners).
+    # May be empty during the transition before all operators have
+    # upgraded; in that state the block-hash component (when present)
+    # supplies the entropy.
     committed_part = "".join(
         str(validator_seeds[v]) for v in sorted(validator_seeds.keys())
     ) if validator_seeds else ""

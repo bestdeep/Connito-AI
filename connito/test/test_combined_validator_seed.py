@@ -1,24 +1,17 @@
 """Regression tests for `get_combined_validator_seed`.
 
-This test file pins two behaviors:
+The seed is derived by mixing TWO entropy sources:
+- validator-committed `miner_seed` values (existing, backward-compat
+  scheme; readable by miners during their commit window)
+- the block hash of the last block of MinerCommit2 (new, added in
+  the block-hash-mix-in PR — sealed before miners commit but
+  unpredictable in advance)
 
-1. The seed is derived by mixing TWO entropy sources:
-   - validator-committed `miner_seed` values (existing, backward-
-     compat scheme; readable by miners during their commit window)
-   - the block hash of the last block of MinerCommit2 (new, added
-     in the block-hash-mix-in PR — sealed before miners commit but
-     unpredictable in advance)
-
-   The block-hash mix-in is the security floor; without it, miners
-   could read all validator-committed seeds during MinerCommit and
-   pre-overfit a checkpoint to the resulting deterministic data
-   slice.
-
-2. If the block-hash component cannot be derived (phase API down,
-   chain RPC failure, archive pruned the block), the function raises
-   `RuntimeError` rather than falling back to a predictable value.
-   Returning a constant like `sha256(b"0")` would itself be an
-   exploit surface.
+If block_hash is unavailable (phase API or chain RPC transient
+failure), it falls back to an empty string so the validator can
+continue through the cycle. A follow-up PR will harden the
+combined "no committed seeds AND no block_hash" case which currently
+produces sha256("") — a publicly-known constant.
 """
 
 from __future__ import annotations
@@ -26,8 +19,6 @@ from __future__ import annotations
 import hashlib
 from types import SimpleNamespace
 from unittest.mock import patch
-
-import pytest
 
 from connito.shared.chain import ValidatorChainCommit
 from connito.shared.cycle import PhaseNames, get_combined_validator_seed
@@ -103,18 +94,31 @@ def test_combined_seed_uses_only_block_hash_when_no_validator_seeds():
     assert out == expected
 
 
-def test_combined_seed_raises_when_block_hash_unavailable():
-    """If the block-hash component cannot be derived, raise. This
-    refuses the prior `sha256(b"0")` fallback — that constant was
-    itself a predictability vulnerability."""
+def test_combined_seed_falls_back_to_empty_when_block_hash_unavailable():
+    """If the block-hash component cannot be derived, fall back to
+    using an empty string for that component so the validator keeps
+    running through transient phase-API / chain-RPC outages.
+
+    During the fallback window the combined seed is sha256(committed_part)
+    only — same security level as the pre-PR scheme, which miners CAN
+    predict from chain reads. Acceptable as a brief transient.
+
+    NOTE: a follow-up PR will harden the combined "no committed seeds
+    AND no block_hash" case, which currently produces sha256("") (a
+    publicly-known constant). That gap is intentionally left open in
+    this PR.
+    """
     commits = [
         (_validator_commit(miner_seed=42, expert_group=0), _neuron("hk_a")),
     ]
     with _patch_block_hash(None):
-        with pytest.raises(RuntimeError, match="block-hash component"):
-            get_combined_validator_seed(
-                _config_for_group(), _StubSubtensor(), commits=commits,
-            )
+        out = get_combined_validator_seed(
+            _config_for_group(), _StubSubtensor(), commits=commits,
+        )
+
+    # block_hash falls back to "", combined = sha256("42" + "") = sha256("42")
+    expected = hashlib.sha256(b"42").hexdigest()
+    assert out == expected
 
 
 def test_combined_seed_filters_by_expert_group():
