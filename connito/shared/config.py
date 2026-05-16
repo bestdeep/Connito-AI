@@ -439,6 +439,14 @@ class WorkerConfig(BaseConfig):
             self.task.base_path = Path("/app/expert_groups")
             logger.info("Docker detected — root_path set to /data")
 
+        # Pull canonical cycle structure (cycle_length, per-phase lengths) from
+        # the owner phase service so every `config.cycle.*` reader (validator
+        # stale-weight age, file pruning, local PhaseManager fallback, etc.)
+        # agrees with the chain. Locked defaults in CycleCfg can lag the on-
+        # chain values by entire phases otherwise. Best-effort: any failure
+        # leaves the locally-loaded values in place.
+        self._refresh_cycle_from_chain()
+
         # Derive paths
         self._refresh_paths()
 
@@ -447,6 +455,96 @@ class WorkerConfig(BaseConfig):
 
         # Create directories
         self._ensure_runtime_dirs()
+
+    def _refresh_cycle_from_chain(self) -> None:
+        """Overwrite stale `cycle.*` periods with the owner-API canonical
+        values. Safe to call repeatedly; no-op on API failure or when the
+        ``CONNITO_CYCLE_SKIP_REFRESH`` env var is set (used by tests and
+        offline replays). Logs the diff for any field that actually changed
+        so the rewrite shows up in startup banners.
+        """
+        if os.environ.get("CONNITO_CYCLE_SKIP_REFRESH"):
+            logger.debug("Skipping cycle refresh (CONNITO_CYCLE_SKIP_REFRESH set)")
+            return
+        # Lazy import: cycle module imports config types, importing it at
+        # module load would create a cycle.
+        try:
+            from connito.shared.cycle import get_cycle_structure_from_api
+        except Exception as e:  # pragma: no cover — defensive
+            logger.debug("Could not import cycle module for refresh", error=str(e))
+            return
+
+        owner_url = (self.cycle.owner_url or "").strip()
+        if not owner_url:
+            return
+
+        try:
+            structure = get_cycle_structure_from_api(
+                owner_url,
+                timeout=int(getattr(self.cycle, "api_timeout_sec", 10)),
+                retries=int(getattr(self.cycle, "api_retries", 3)),
+                backoff=int(getattr(self.cycle, "api_backoff_sec", 2)),
+            )
+        except Exception as e:
+            logger.warning(
+                "Cycle refresh from owner API failed; keeping local CycleCfg defaults. "
+                "Schedulers may drift from on-chain reality.",
+                owner_url=owner_url,
+                error=str(e),
+            )
+            return
+
+        if structure is None:
+            logger.warning(
+                "Cycle refresh from owner API returned no data; keeping local CycleCfg defaults.",
+                owner_url=owner_url,
+            )
+            return
+
+        # Map API phase name → name of the matching CycleCfg period attr.
+        # The local config collapses all four commit phases onto a single
+        # `commit_period` knob, so we take MinerCommit1's length as the
+        # canonical commit period and ignore the others. If the on-chain
+        # schedule ever sets per-commit-phase lengths that differ, the
+        # local config can't represent that and would need a schema change.
+        api_to_local = {
+            "Distribute": "distribute_period",
+            "Train": "train_period",
+            "MinerCommit1": "commit_period",
+            "Submission": "submission_period",
+            "Validate": "validate_period",
+            "Merge": "merge_period",
+        }
+        changes: dict[str, tuple[Any, Any]] = {}
+        for phase in structure.get("phases", []):
+            name = phase.get("name")
+            length = phase.get("length")
+            if not isinstance(name, str) or not isinstance(length, int):
+                continue
+            field = api_to_local.get(name)
+            if field is None:
+                continue
+            old = getattr(self.cycle, field, None)
+            if old != length:
+                setattr(self.cycle, field, length)
+                changes[field] = (old, length)
+
+        new_cycle_length = structure.get("cycle_length")
+        if isinstance(new_cycle_length, int) and new_cycle_length != self.cycle.cycle_length:
+            changes["cycle_length"] = (self.cycle.cycle_length, new_cycle_length)
+            self.cycle.cycle_length = new_cycle_length
+
+        if changes:
+            logger.info(
+                "Refreshed CycleCfg from owner API",
+                owner_url=owner_url,
+                changes={k: f"{v[0]} -> {v[1]}" for k, v in changes.items()},
+            )
+        else:
+            logger.debug(
+                "CycleCfg already matches owner API; no changes",
+                owner_url=owner_url,
+            )
 
     # -----------------------
     # Derived paths / IO

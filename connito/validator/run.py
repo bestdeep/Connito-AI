@@ -882,6 +882,7 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
     poller = SystemStatePoller(
         subtensor=lite_subtensor,
         phase_manager=PhaseManager(config, lite_subtensor),
+        config=config,
         group_averagers=group_averagers,
         netuid=config.chain.netuid,
         validator_uid=validator_uid,

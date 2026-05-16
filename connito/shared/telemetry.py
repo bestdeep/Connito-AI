@@ -347,11 +347,20 @@ class SystemStatePoller(threading.Thread):
         validator_uid: int | None = None,
         interval_sec: float = 12.0,
         metagraph_poll_every_n_polls: int = 5,
+        config=None,
     ):
         super().__init__(daemon=True)
         self.interval = interval_sec
         self.subtensor = subtensor
+        # `phase_manager` (built from local config periods) is intentionally
+        # kept only as a last-resort fallback. The locked `cycle.*` fields can
+        # be stale relative to the actual on-chain schedule (the owner can
+        # change phase lengths without forcing all miners to redeploy), which
+        # causes locally-computed phase indices to drift by minutes per cycle
+        # and made Grafana disagree with `wait_till`-driven code paths like
+        # `model_io.py`. We prefer the owner phase service when available.
         self.phase_manager = phase_manager
+        self.config = config
         self.group_averagers = group_averagers
         self.netuid = netuid
         self.validator_uid = validator_uid
@@ -361,6 +370,10 @@ class SystemStatePoller(threading.Thread):
         # with the caller's subtensor. Created lazily on first poll.
         self._local_subtensor = None
         self._poll_count: int = 0
+        # Cache the last successful phase response so a transient API outage
+        # doesn't make the dashboard go dark; we keep showing the most recent
+        # good value until the API comes back or we fall back to local.
+        self._cached_phase_resp = None
         # Holds the prior tick's UID set so we can diff for deregistrations.
         # Stays empty until the first metagraph sync runs successfully; we
         # skip emitting the deregistration counter on that first tick.
@@ -385,6 +398,42 @@ class SystemStatePoller(threading.Thread):
             self._poll_count += 1
             self._stop_event.wait(self.interval)
 
+    def _resolve_phase(self, block: int):
+        """Resolve the current cycle phase, preferring the authoritative owner
+        phase service.
+
+        Priority order:
+          1. Owner phase API (`get_phase_from_api`) — authoritative source the
+             rest of the cycle code (`wait_till`, etc.) already uses.
+          2. Last cached successful API response — keeps the dashboard alive
+             through transient owner-API outages instead of going dark.
+          3. Local `PhaseManager` — last-resort fallback, computed from
+             possibly-stale local cycle periods. May drift; that's why this
+             ordering exists.
+
+        Returns a PhaseResponse-shaped object (with at least ``phase_index``
+        and ``blocks_remaining_in_phase``) or ``None`` if no source works.
+        """
+        if self.config is not None:
+            # Lazy import to avoid telemetry-module load-time cycle with
+            # connito.shared.cycle (which itself imports config types).
+            try:
+                from connito.shared.cycle import get_phase_from_api
+                api_resp = get_phase_from_api(self.config)
+            except Exception as e:
+                logger.debug(f"get_phase_from_api raised: {e}")
+                api_resp = None
+            if api_resp is not None:
+                self._cached_phase_resp = api_resp
+                return api_resp
+            if self._cached_phase_resp is not None:
+                logger.debug("Phase API unavailable; serving cached response")
+                return self._cached_phase_resp
+
+        if self.phase_manager is not None:
+            return self.phase_manager.get_phase(block)
+        return None
+
     def _poll(self):
         # 1. Update Chain Block & Phase Variables
         if self.subtensor:
@@ -397,8 +446,8 @@ class SystemStatePoller(threading.Thread):
                 block = self._local_subtensor.get_current_block()
                 SUBNET_CURRENT_BLOCK.set(block)
 
-                if self.phase_manager:
-                    phase_resp = self.phase_manager.get_phase(block)
+                phase_resp = self._resolve_phase(block)
+                if phase_resp is not None:
                     SUBNET_PHASE_INDEX.set(phase_resp.phase_index)
                     SUBNET_BLOCKS_REMAINING.set(phase_resp.blocks_remaining_in_phase)
             except Exception as e:

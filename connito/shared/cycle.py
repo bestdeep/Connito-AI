@@ -660,6 +660,46 @@ def get_phase_from_api(config: WorkerConfig) -> PhaseResponse | None:
         return None
 
 
+def get_cycle_structure_from_api(
+    owner_url: str,
+    *,
+    timeout: int = 10,
+    retries: int = 3,
+    backoff: int = 2,
+) -> dict | None:
+    """Fetch the canonical cycle structure (cycle_length + phase lengths) from
+    the owner phase service.
+
+    The service's root endpoint returns:
+
+        {
+          "cycle_length": <int>,
+          "phases": [{"index": 0, "name": "Distribute", "length": 20}, ...]
+        }
+
+    Returns the parsed dict, or ``None`` on any failure (network, JSON, etc.).
+    Used at config load time to overwrite stale local `cycle.*` defaults so
+    every code path that reads `config.cycle.*` (validator stale-weight age,
+    file pruning, local PhaseManager fallback, etc.) agrees with the chain.
+
+    Standalone helper (vs. methods on a `WorkerConfig`) so it can be called
+    before the parent config is fully constructed.
+    """
+    url = f"{owner_url.rstrip('/')}/"
+    resp = _get_with_retry(url, timeout=timeout, retries=retries, backoff=backoff)
+    if resp is None:
+        return None
+    try:
+        data = resp.json()
+    except ValueError as e:
+        logger.warning("Bad JSON from cycle structure endpoint", url=url, error=str(e))
+        return None
+    if not isinstance(data, dict) or "phases" not in data or "cycle_length" not in data:
+        logger.warning("Unexpected cycle structure payload", url=url, payload_keys=list(data.keys()) if isinstance(data, dict) else type(data).__name__)
+        return None
+    return data
+
+
 def get_blocks_until_next_phase_from_api(config: WorkerConfig) -> dict[str, tuple[int, int, int]] | None:
     """
     Determine current phase based on block schedule.

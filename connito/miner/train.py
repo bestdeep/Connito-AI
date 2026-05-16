@@ -275,8 +275,9 @@ def train_worker(rank: int, world_size: int, config: MinerConfig) -> None:
 
     # Start telemetry sidecar poller
     poller = SystemStatePoller(
-        subtensor=subtensor, 
+        subtensor=subtensor,
         phase_manager=PhaseManager(config, subtensor),
+        config=config,
         interval_sec=12.0
     )
     poller.start()
